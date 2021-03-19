@@ -122,6 +122,7 @@ bool send_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::const_buffer
 
 inline static const unsigned int testnet_magic_number = 0x0709110b;
 inline static const unsigned int version              = 0x00011180;
+inline static const char user_agent[] = "ourNode:0.0";
 
 struct message
 {
@@ -140,6 +141,40 @@ struct message
 		serialize_little_endian((unsigned char*)header, testnet_magic_number);
 		std::strncpy((char*)&header[4], std::string(12,0).c_str(), 12);
 		std::strncpy((char*)&header[4], cmd.c_str(), 12);
+	}
+
+	template<typename T>
+	void append_little_endian(T t)
+	{
+		for (int i=0 ; i<sizeof(T) ; i++, t >>= 8)
+			body.push_back((char)(t & 0xFF));
+	}
+	template<typename C>
+	void append_bytes(const C b[], size_t N)
+	{
+		body.append((char*)b, (char*)b+N);
+	}
+	void append_str(const char b[], size_t N)
+	{
+		append_var_int(N);
+		append_bytes(b, N);
+	}
+	void append_var_int(size_t s)
+	{
+		if (s < 0xFD)
+			body.push_back((char)s);
+		else if (s <= 0xFFFF)
+		{
+			body.push_back((char)0xFD);
+			append_little_endian(std::uint16_t(s));
+		}
+		else if (s <= 0xFFFFFFFF)
+		{
+			body.push_back((char)0xFE);
+			append_little_endian(std::uint32_t(s));
+		}
+		else
+			append_little_endian(s);
 	}
 
 	bool recv(boost::asio::ip::tcp::socket & socket, std::chrono::seconds timeout)
@@ -276,23 +311,21 @@ struct peer : std::enable_shared_from_this<peer>
 
 	void send_version_msg()
 	{
-		message m("version");
-		unsigned char version_msg[] = {	  
-			0x00, 0x00, 0x00, 0x00, // version field
-			0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // services
-			0x11, 0xb2, 0xd0, 0x50, 0x00, 0x00, 0x00, 0x00, // time
-			0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x3b, 0x2e, 0xb3, 0x5d, 0x8c, 0xe6, 0x17, 0x65, // nonce
-			0x0b, 0x6f, 0x75, 0x72, 0x4e, 0x6f, 0x64, 0x65, 0x3a, 0x30, 0x2e, 0x30, // user agent ourNode:0.0
-			0x00, 0x00, 0x00, 0x00, // start_height
-		};
-		serialize_little_endian(version_msg, version);
+		size_t services = 0;
 		std::int64_t unix_time = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-		serialize_little_endian(&version_msg[4+8], unix_time);
-		serialize_little_endian(&version_msg[4+8+8+26+26], nonce);
+		unsigned char ipv6[26] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+		int32_t start_height = 0;
 
-		m.body.insert(m.body.end(), version_msg, version_msg+sizeof(version_msg));
+		message m("version");
+		m.append_little_endian(version);
+		m.append_little_endian(services);
+		m.append_little_endian(unix_time);
+		m.append_bytes(ipv6, sizeof(ipv6));
+		m.append_bytes(ipv6, sizeof(ipv6));
+		m.append_little_endian(nonce);
+		m.append_str(user_agent, sizeof(user_agent));
+		m.append_little_endian(start_height);
+
 		m.send(socket);
 
 		std::cout << "sent " << m.len << " bytes of -version- to " << peer_config.ip << " " << peer_config.port << std::endl;
