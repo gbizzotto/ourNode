@@ -17,10 +17,11 @@ inline void px(const std::string_view sv)
 {
 	for (auto s: sv)
 		printf("%02x", (unsigned char)s);
+	printf("\n");
 }
 
 template<typename T>
-T consume_low_endian(std::string_view & data)
+T consume_little_endian(std::string_view & data)
 {
 	if (data.size() < sizeof(T))
 		throw std::invalid_argument("not enough data");
@@ -44,10 +45,16 @@ T consume_big_endian(std::string_view & data)
 	return result;
 }
 template<typename T>
-void serialize_low_endian(unsigned char * data, T value)
+void serialize_little_endian(unsigned char * data, T value)
 {
 	for (int i=0 ; i<sizeof(T) ; i++, value >>= 8)
-		*data++ = value & 0xFF;
+		*data++ = (value & 0xFF);
+}
+template<typename T>
+void serialize_big_endian(unsigned char * data, T value)
+{
+	for (int i=sizeof(T)-1 ; i>0 ; i--)
+		*data++ = ((value >> (8*i)) & 0xFF);
 }
 std::uint64_t consume_var_int(std::string_view & data)
 {
@@ -56,24 +63,24 @@ std::uint64_t consume_var_int(std::string_view & data)
 	unsigned char first = data[0];
 	data.remove_prefix(1);
 	if (first == 0xFF) {
-		auto result = consume_low_endian<std::uint64_t>(data);
+		auto result = consume_little_endian<std::uint64_t>(data);
 		return result;
 	} else if (first == 0xFE) {
-		auto result = consume_low_endian<std::uint32_t>(data);
+		auto result = consume_little_endian<std::uint32_t>(data);
 		return result;
 	} else if (first == 0xFD) {
-		auto result = consume_low_endian<std::uint16_t>(data);
+		auto result = consume_little_endian<std::uint16_t>(data);
 		return result;
 	} else {
 		return first;
 	}
 }
-void consume_bytes(std::string_view & data, char *buf, size_t len)
+void consume_bytes(std::string_view & src, char *dst, size_t len)
 {
-	if (data.size() < len)
+	if (src.size() < len)
 		throw std::invalid_argument("data.size() < 1");
-	std::copy(data.data(), data.data()+len, buf);
-	data.remove_prefix(len);
+	std::copy(src.data(), src.data()+len, dst);
+	src.remove_prefix(len);
 }
 
 std::uint32_t calculate_checksum(unsigned char * data, size_t len)
@@ -81,7 +88,7 @@ std::uint32_t calculate_checksum(unsigned char * data, size_t len)
 	Hash256 hash;
 	fill_dbl_sha256(hash, std::string_view((char*)data, len));
 	std::string_view sv((char*)hash.h, 4);
-	return consume_low_endian<std::uint32_t>(sv);
+	return consume_little_endian<std::uint32_t>(sv);
 }
 
 bool recv_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::mutable_buffer buffer, std::chrono::seconds timeout)
@@ -127,10 +134,12 @@ struct message
 	std::uint32_t checksum;
 
 	message() = default;
-	message(std::string type)
+	message(const std::string cmd)
+		: command(cmd)
 	{
-		serialize_low_endian((unsigned char*)header, testnet_magic_number);
-		std::strncpy((char*)&header[4], type.data(), 12);
+		serialize_little_endian((unsigned char*)header, testnet_magic_number);
+		std::strncpy((char*)&header[4], std::string(12,0).c_str(), 12);
+		std::strncpy((char*)&header[4], cmd.c_str(), 12);
 	}
 
 	bool recv(boost::asio::ip::tcp::socket & socket, std::chrono::seconds timeout)
@@ -140,12 +149,12 @@ struct message
 		
 		std::string_view sv(header, 24);
 
-		magic_number = consume_low_endian<decltype(magic_number)>(sv);
+		magic_number = consume_little_endian<decltype(magic_number)>(sv);
 		for (char *ptr=&header[4] ; ptr<&header[16] && *ptr!=0 ; ++ptr)
 			command.push_back(*ptr);
 		sv.remove_prefix(12);
-		len = consume_low_endian<decltype(len)>(sv);
-		checksum = consume_low_endian<decltype(checksum)>(sv);
+		len = consume_little_endian<decltype(len)>(sv);
+		checksum = consume_little_endian<decltype(checksum)>(sv);
 
 		if (magic_number != testnet_magic_number) {
 			std::cout << "Bad magic number." << std::endl;
@@ -171,18 +180,11 @@ struct message
 	bool send(boost::asio::ip::tcp::socket & socket)
 	{
 		len = body.size();
-		header[16] = len & 0xFF;
-		header[17] = (len >> 8) & 0xFF;
-		header[18] = (len >> 16) & 0xFF;
-		header[19] = (len >> 24) & 0xFF;
-		Hash256 dblsha;
-		fill_dbl_sha256(dblsha, std::string_view(body.data(), len));
-		header[20] = dblsha[0];
-		header[21] = dblsha[1];
-		header[22] = dblsha[2];
-		header[23] = dblsha[3];
+		checksum = calculate_checksum((unsigned char*)body.data(), len);
+		serialize_little_endian((unsigned char*)&header[16], len);
+		serialize_little_endian((unsigned char*)&header[20], checksum);
 
-		return send_bytes(socket, boost::asio::buffer((char*)header, 24), std::chrono::seconds(5))
+		return send_bytes(socket, boost::asio::buffer((char*)header, sizeof(header)), std::chrono::seconds(5))
 			&& send_bytes(socket, boost::asio::buffer(body.data(), len) , std::chrono::seconds(5));
 	}
 };
@@ -198,9 +200,8 @@ struct peer : std::enable_shared_from_this<peer>
 	config::peer peer_config;
 	utttil::synchronized<ournode::config> & conf;
 
+	boost::fibers::fiber handshake_fiber;
 	std::map<std::string, boost::fibers::promise<message>> expected_messages;
-
-	boost::fibers::fiber this_fiber;
 
 	peer(boost::asio::io_context & io_context, config::peer peer_config_, utttil::synchronized<ournode::config> & conf_)
 		: socket(io_context)
@@ -212,14 +213,16 @@ struct peer : std::enable_shared_from_this<peer>
 	{}
 	~peer()
 	{
-		this_fiber.join();
+		if (handshake_fiber.joinable())
+			handshake_fiber.join();
+		std::cout << "peer dies." << std::endl;
 	}
 
 	const config::peer & get_config() const { return peer_config; }
 
 	void start()
 	{
-		this_fiber = boost::fibers::fiber([this](){ run(); });
+		boost::fibers::fiber([this](){ run(); std::cout << "fiber ends." << std::endl; }).detach();
 	}
 
 	void run()
@@ -228,10 +231,11 @@ struct peer : std::enable_shared_from_this<peer>
 			return;
 
 		// handshake
-		send_version_msg();
-		auto handshake_fiber = boost::fibers::fiber([this](){
+		handshake_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch,
+			[this](){
+				send_version_msg();
 				handshaken = expect({"version","verack"}, std::chrono::seconds(5));
-				error = ! handshaken;
+				error &= ! handshaken;
 				if (handshaken) {
 					std::cout << "Connected to " << peer_config.ip << " " << peer_config.port << std::endl;
 					message("getaddr").send(socket);
@@ -280,19 +284,19 @@ struct peer : std::enable_shared_from_this<peer>
 			0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x3b, 0x2e, 0xb3, 0x5d, 0x8c, 0xe6, 0x17, 0x65, // nonce
-			0x0a, 0x6d, 0x79, 0x6e, 0x6f, 0x64, 0x65, 0x3a, 0x30, 0x2e, 0x30, // user agent mynode:0.0
+			0x0b, 0x6f, 0x75, 0x72, 0x4e, 0x6f, 0x64, 0x65, 0x3a, 0x30, 0x2e, 0x30, // user agent ourNode:0.0
 			0x00, 0x00, 0x00, 0x00, // start_height
 		};
-		serialize_low_endian(version_msg, version);
+		serialize_little_endian(version_msg, version);
 		std::int64_t unix_time = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-		serialize_low_endian(&version_msg[4+8], unix_time);
-		serialize_low_endian(&version_msg[4+8+8+26+26], nonce);
+		serialize_little_endian(&version_msg[4+8], unix_time);
+		serialize_little_endian(&version_msg[4+8+8+26+26], nonce);
 
 		m.body.insert(m.body.end(), version_msg, version_msg+sizeof(version_msg));
 		m.send(socket);
 
 		std::cout << "sent " << m.len << " bytes of -version- to " << peer_config.ip << " " << peer_config.port << std::endl;
-		//px((char*)header, 24);
+		px({(char*)m.header, 24});
 		//px((char*)buf, len);
 		//std::cout << std::endl;
 	}
@@ -301,20 +305,20 @@ struct peer : std::enable_shared_from_this<peer>
 	{
 		for (const std::string & msg_type : msg_types)
 		{
-			//std::cout << "expecting " << msg_type << " " << peer_config.ip << "  " << peer_config.port << std::endl;
+			std::cout << "expecting " << msg_type << " " << peer_config.ip << "  " << peer_config.port << std::endl;
 			expected_messages.emplace(msg_type,boost::fibers::promise<message>());
 		}
 		bool got_all = true;
 		auto deadline = std::chrono::system_clock::now() + timeout;
 		for (const std::string & msg_type : msg_types)
 		{
-			//std::cout << "Now waiting for " << msg_type << " " << peer_config.ip << "  " << peer_config.port << std::endl;
+			std::cout << "Now waiting for " << msg_type << " " << peer_config.ip << "  " << peer_config.port << std::endl;
 			bool got_this_one = expected_messages[msg_type].get_future().wait_until(deadline) == boost::fibers::future_status::ready;
-			//std::cout << "Got " << msg_type << " ? " << got_this_one << " " << peer_config.ip << "  " << peer_config.port << std::endl;
+			std::cout << "Got " << msg_type << " ? " << got_this_one << " " << peer_config.ip << "  " << peer_config.port << std::endl;
 			got_all &= got_this_one;
 			expected_messages.erase(msg_type);
 		}
-		//std::cout << "expect fulfilled " << peer_config.ip << "  " << peer_config.port << std::endl;
+		std::cout << "expect fulfilled " << peer_config.ip << "  " << peer_config.port << std::endl;
 		return got_all;
 	}
 
@@ -336,6 +340,26 @@ struct peer : std::enable_shared_from_this<peer>
 			message("verack").send(socket);
 		else if (m.command == "addr")
 			process_addr_msg(m);
+		else if (m.command == "reject")
+		{
+			std::string_view sv(m.body.data(), m.body.size());
+
+			size_t rejected_len = consume_var_int(sv);
+			std::string rejected_message(rejected_len+1, 0);
+			strncpy(rejected_message.data(), sv.data(), rejected_len);
+			sv.remove_prefix(rejected_len);
+
+			char code = consume_little_endian<char>(sv);
+
+			size_t reason_len = consume_var_int(sv);
+			std::string reason_message(reason_len+1, 0);
+			strncpy(reason_message.data(), sv.data(), reason_len);
+			sv.remove_prefix(reason_len);
+
+			std::cout << "Rejected " << rejected_message << ", because " << reason_message << std::endl;
+
+		}
+
 		//else if (std::strcmp(&header[4], "headers") == 0)
 		//	process_headers_msg(std::string_view(body.get(), len));
 		//else if (std::strcmp(&header[4], "inv") == 0)
@@ -353,8 +377,8 @@ struct peer : std::enable_shared_from_this<peer>
 
 		for (int i=0 ; i<naddr ; i++)
 		{
-			auto timestamp = consume_low_endian<std::uint32_t>(sv);
-			auto type      = consume_low_endian<std::uint64_t>(sv);
+			auto timestamp = consume_little_endian<std::uint32_t>(sv);
+			auto type      = consume_little_endian<std::uint64_t>(sv);
 			std::array<unsigned char, 16> ipv6;
 			consume_bytes(sv, (char*)&ipv6[0], 16);
 
@@ -398,10 +422,10 @@ struct network
 
 	void run()
 	{
-        io_context = std::make_shared<boost::asio::io_context>();
-        boost::fibers::use_scheduling_algorithm<boost::fibers::asio::round_robin>(io_context);
+		io_context = std::make_shared<boost::asio::io_context>();
+		boost::fibers::use_scheduling_algorithm<boost::fibers::asio::round_robin>(io_context);
 
-        keep_well_connected_fiber = boost::fibers::fiber([this](){ keep_well_connected(); });
+		keep_well_connected_fiber = boost::fibers::fiber([this](){ keep_well_connected(); });
 		keep_up_to_date_fiber     = boost::fibers::fiber([this](){ keep_up_to_date(); });
 		boost::this_fiber::sleep_for(std::chrono::seconds(1));
 		
