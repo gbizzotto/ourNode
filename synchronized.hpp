@@ -64,6 +64,10 @@ public:
 	synchronized(T && t)
 		:t(std::move(t))
 	{}
+	template<typename... Args>
+	synchronized(Args... args)
+		:t(args...)
+	{} 
 	
 	synchronized(const proxy_type & sp)
 		:t(*sp.t)

@@ -33,7 +33,7 @@ struct Hash256
 	}
 };
 
-Hash256 operator "" _bigendian_sha256(const char * literal)
+Hash256 operator "" _littleendian_sha256(const char * literal)
 {
 	static char val[256] = {
 		0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -49,6 +49,12 @@ Hash256 operator "" _bigendian_sha256(const char * literal)
 	int it = 0;
 	for (const char *l=literal+2 ; *l!=0 && *(l+1)!=0 && it<32 ; ++it,++++l)
 		result[it] = (val[*l]<<4) + val[*(l+1)];
+	return result;
+}
+Hash256 operator "" _bigendian_sha256(const char * literal)
+{
+	auto result = operator ""_littleendian_sha256(literal);
+	std::reverse(result.h, result.h+32);
 	return result;
 }
 
