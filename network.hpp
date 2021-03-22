@@ -20,18 +20,6 @@ namespace ournode {
 
 #define MSG_BLOCK 2
 
-inline void px(const std::string_view sv)
-{
-	for (auto s: sv)
-		printf("%02x", (unsigned char)s);
-}
-inline void pxln(const std::string_view sv)
-{
-	for (auto s: sv)
-		printf("%02x", (unsigned char)s);
-	printf("\n");
-}
-
 template<typename T>
 T consume_little_endian(std::string_view & data)
 {
@@ -112,8 +100,10 @@ bool recv_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::mutable_buff
 		[promise=std::move(promise)](const boost::system::error_code& ec, std::size_t bytes_transferred) mutable {
 			promise.set_value(!ec);
 		});
-	if (future.wait_for(timeout) != boost::fibers::future_status::ready)
+	if (future.wait_for(timeout) != boost::fibers::future_status::ready) {
+		socket.cancel();
 		return false;
+	}
 	return future.get();
 }
 bool send_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::const_buffer buffer, std::chrono::seconds timeout)
@@ -125,8 +115,10 @@ bool send_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::const_buffer
 	socket.async_send(buffer, [promise=std::move(promise)](const boost::system::error_code & ec, std::size_t bytes_transferred) mutable {
 			promise.set_value(!ec);
 		});
-	if (future.wait_for(timeout) != boost::fibers::future_status::ready)
+	if (future.wait_for(timeout) != boost::fibers::future_status::ready) {
+		socket.cancel();
 		return false;
+	}
 	return future.get();
 }
 
@@ -228,7 +220,7 @@ transaction consume_tx(std::string_view & data)
 {
 	transaction tx;
 
-	consume_little_endian<std::int32_t>(data); // skip version
+	auto version = consume_little_endian<std::int32_t>(data);
 
 	tx.has_witness = false;
 	if (data.data()[0] == 0) {
@@ -236,12 +228,10 @@ transaction consume_tx(std::string_view & data)
 		data.remove_prefix(2);
 	}
 	auto nin = consume_var_int(data);
-				std::cout << nin << " inputs" << std::endl;
 	for (decltype(nin) i=0 ; i<nin ; i++)
 		tx.inputs.emplace_back(consume_vin(data));
 	auto nout = consume_var_int(data);
-			std::cout << nout << " outputs" << std::endl;
-	for (decltype(nout) i=0 ; i<nin ; i++)
+	for (decltype(nout) i=0 ; i<nout ; i++)
 		tx.outputs.emplace_back(consume_vout(data));
 	if (tx.has_witness)
 		consume_witness(data);
@@ -468,6 +458,7 @@ struct peer : std::enable_shared_from_this<peer>
 				promise.set_value(!ec);
 			});
 		if (future.wait_for(std::chrono::seconds(5)) != boost::fibers::future_status::ready) {
+			socket.cancel();
 			error = true;
 			return false;
 		}
@@ -581,6 +572,9 @@ struct peer : std::enable_shared_from_this<peer>
 			process_reject_msg(m);
 		else if (m.command == "verack")
 		{} // not much to do here
+		else if (m.command == "block")
+		{
+		}
 		else
 		{
 			std::cout << "Msg not handled: " << m.command << std::endl;
@@ -663,8 +657,6 @@ struct peer : std::enable_shared_from_this<peer>
 	std::tuple<bool,message> get_block(const Hash256 & block_hash)
 	{
 		send_block_getdata_msg(block_hash);
-		bool rcvd;
-		message block_msg;
 		return expect("block");
 	}
 };
@@ -754,7 +746,7 @@ struct network
 	std::shared_ptr<peer> select_peer()
 	{
 		// Random for now. How about a round robin here?
-		return *std::next(handshaken_peers.begin(), 0 /*rand()%(handshaken_peers.size()-1)*/);
+		return *std::next(handshaken_peers.begin(), rand() % handshaken_peers.size());
 	}
 
 	void keep_up_to_date()
@@ -763,32 +755,77 @@ struct network
 			boost::this_fiber::sleep_for(std::chrono::milliseconds(1));
 
 		// initial sync
-		//for (int i=0 ; i<conf->min_peer_count ; i++)
+		for (int i=0 ; i<conf->min_peer_count ; i++)
 		{
 			auto peer = select_peer();
+			if ( ! peer || peer->error) {
+				std::cout << "Bad peer chosen" << std::endl;
+				continue;
+			}
 			if (bc->height() == 0)
 			{
 				bool rcvd;
 				message genesis_block_msg;
 				std::tie(rcvd,genesis_block_msg) = peer->get_block(blockchain::testnet_genesis_block_hash);
-				if (rcvd)
-					process_block_msg(genesis_block_msg);
-				else
-					std::cout << "Failed to get the genesis block" << std::endl;
+				if ( ! rcvd)
+					continue;
+				try
+				{
+					if (process_block_msg(genesis_block_msg, blockchain::testnet_genesis_block_hash))
+						break;
+				}
+				catch (const std::exception & e)
+				{
+					const boost::stacktrace::stacktrace* st = boost::get_error_info<traced>(e);
+					break;
+				}
 			}
-			
-			std::cout << "Synching from block height " << bc->height() << std::endl;
+		}
+		if (bc->height() == 0)
+		{
+			std::cout << "Failed to get the genesis block" << std::endl;
+			return;
+		}
+
+		std::cout << "Synching from block height " << bc->height() << std::endl;
+		for (int i=0 ; i<conf->min_peer_count ;)
+		{
+			auto peer = select_peer();
 			auto & last_known_hash = bc->get_last_known_block_hash();
 			bool rcvd;
 			message headers_msg;
 			std::tie(rcvd,headers_msg) = peer->get_headers(last_known_hash);
-			if (rcvd)
-				process_headers_msg(headers_msg);
+			if ( ! rcvd) {
+				++i;
+				continue;
+			}
+			try
+			{
+				std::vector<std::tuple<block,Hash256>> headers = process_headers_msg(headers_msg);
+				for (std::tuple<block,Hash256> & p : headers)
+				{
+					if (bc->has(std::get<1>(p)))
+						continue;
+					bool rcvd;
+					message genesis_block_msg;
+					std::tie(rcvd,genesis_block_msg) = peer->get_block(std::get<1>(p));
+					process_block_msg(genesis_block_msg, std::get<1>(p));
+				}
+				auto & new_last_known_hash = bc->get_last_known_block_hash();
+				if (new_last_known_hash == last_known_hash)
+					++i;
+			}
+			catch (std::exception & e)
+			{}
 		}
+
+		// all up-to-date
 	}
 
-	void process_headers_msg(const message & msg)
+	std::vector<std::tuple<block,Hash256>> process_headers_msg(const message & msg)
 	{
+		std::vector<std::tuple<block,Hash256>> result;
+
 		std::string_view data(msg.body.data(), msg.body.size());
 
 		std::uint64_t nheaders;
@@ -802,25 +839,23 @@ struct network
 			Hash256 hash;
 			std::tie(bl, hash) = consume_header(data, true);
 			const char * header_end = data.data();
-			
-			//bc->add(bl, hash);
+			result.push_back({std::move(bl), hash});
 		}
+		return result;
 	}
-	void process_block_msg(const message & msg)
+	bool process_block_msg(const message & msg, const Hash256 & supposed_block_hash)
 	{
-		std::cout << std::hex << msg << std::dec << std::endl;
-
 		std::string_view data(msg.body.data(), msg.body.size());
 
 		if (data.size() < 81)
 		{
 			std::cout << "BLOCK DROPPED: block was truncated." << std::endl;
-			return;
+			return false;
 		}
 
-				// std::string block_hash = dbl_sha256({data.data(), 80});
-				// std::reverse(block_hash.begin(), block_hash.end());
-				// pxln(block_hash.data(), 32);
+		// std::string block_hash = dbl_sha256({data.data(), 80});
+		// std::reverse(block_hash.begin(), block_hash.end());
+		// pxln(block_hash.data(), 32);
 
 		// unsigned char * announced_previous_block_hash = (unsigned char*)data.data()+4;
 		// if ( ! bc.is_block_hash_close_to_tip(announced_previous_block_hash))
@@ -833,62 +868,24 @@ struct network
 		Hash256 hash;
 		std::tie(bl, hash) = consume_header(data, false);
 
+		if (hash != supposed_block_hash) {
+			std::cout << "Was expecting " << supposed_block_hash
+			          << ", got " << hash << std::endl;
+			return false;
+		}
+
 		std::cout << "Block hash: " << std::hex << hash << std::dec << std::endl;
 
 		auto ntx = consume_var_int(data);
-		std::cout << "ntx: " << ntx << std::endl;
 		for (int i=0 ; i<ntx ; i++)
-		{
-			transaction tx = consume_tx(data);
-						std::cout << "vin: " << std::endl;
-						for (int i=0 ; i<tx.inputs.size() ; i++)
-						{
-									std::cout << "  txid: ";
-									pxln(std::string_view((char*)tx.inputs[i].txid.h, 32));
-									std::cout << std::endl;
-									std::cout << "  idx: " << tx.inputs[i].idx << std::endl;
-									std::cout << "  scriptsig: ";
-									px(std::string_view((char*)tx.inputs[i].scriptsig.get(), tx.inputs[i].script_size));
-									std::cout << std::endl;
-									std::cout << "  scriptsig: ";
-									for (unsigned char *ptr=tx.inputs[i].scriptsig.get(),*end=ptr+tx.inputs[i].script_size ; ptr<end ; )
-									{
-										if (*ptr == 0 || *ptr>75) {
-											printf("%02X ", *ptr);
-											ptr++;
-										} else {
-											px(std::string_view((char*)ptr+1, *ptr));
-											printf(" ");
-											ptr += *ptr + 1;
-										}
-									}
-									std::cout << std::endl;
-									std::cout << "  sequence: " << std::hex << tx.inputs[i].sequence << std::dec << std::endl;
-									printf("\n");
-						}
-						std::cout << "vout: " << std::endl;
-						for (int i=0 ; i<tx.outputs.size() ; i++)
-						{
-									std::cout << "  amount: " << tx.outputs[i].amount << std::endl;
-									std::cout << "  scriptpubkey: ";
-									px(std::string_view((char*)tx.outputs[i].scriptpubkey.get(), tx.outputs[i].script_size));
-									std::cout << std::endl;
-									std::cout << "  scriptpubkey: ";
-									for (unsigned char *ptr=tx.outputs[i].scriptpubkey.get(),*end=ptr+tx.outputs[i].script_size ; ptr<end ; )
-									{
-										if (*ptr == 0 || *ptr>75) {
-											printf("%02X ", *ptr);
-											ptr++;
-										} else {
-											px(std::string_view((char*)ptr+1, *ptr));
-											printf(" ");
-											ptr += *ptr + 1;
-										}
-									}
-									printf("\n");
-						}
-			bl.txs.push_back(tx);
-		}
+			bl.txs.push_back(consume_tx(data));
+		//std::cout << "ntx: " << ntx << std::endl;
+		//if (ntx > 1)
+		//	for (int i=0 ; i<ntx ; i++)
+		//		std::cout << "tx " << i << std::endl
+		//				<< bl.txs[i] << std::endl;
+
+		return bc->add(std::move(bl), hash);
 	}
 };
 

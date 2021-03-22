@@ -63,11 +63,39 @@ O & operator<<(O & out, const Hash256 & hash)
 {
 	std::ios_base::fmtflags f(out.flags());
 	for (int i=0 ; i<32 ; i++)
-		out << std::setw(2) << std::setfill('0') << std::hex << (int)hash[i];
+		out << std::setw(2) << std::setfill('0') << std::hex << (int)hash[i] << std::dec;
 	out.flags(f);
 	return out;
 }
 
+inline void px(const std::string_view sv)
+{
+	for (auto s: sv)
+		printf("%02x", (unsigned char)s);
+}
+inline void pxln(const std::string_view sv)
+{
+	for (auto s: sv)
+		printf("%02x", (unsigned char)s);
+	printf("\n");
+}
+template<typename O>
+inline void px(O & o, const std::string_view sv)
+{
+	auto s = o.rdstate();
+	for (auto s: sv)
+		o << std::setw(2) << std::setfill('0') << std::hex << (unsigned(s)&0xff) << std::dec;
+	o.setstate(s);
+}
+template<typename O>
+inline void pxln(O & o, const std::string_view sv)
+{
+	auto s = o.rdstate();
+	for (auto s: sv)
+		o << std::setw(2) << std::setfill('0') << std::hex << (unsigned(s)&0xff) << std::dec;
+	o << std::endl;
+	o.setstate(s);
+}
 
 template<typename STREAM>
 struct SHA256PaddingStream
