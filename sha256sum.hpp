@@ -1,15 +1,140 @@
 
 #pragma once
 
+#include <algorithm>
+#include <numeric>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <deque>
+#include <vector>
 #include <iostream>
 #include <iomanip>
 #include <type_traits>
 
+inline void px(const std::string_view sv)
+{
+	for (auto s: sv)
+		printf("%02x", (unsigned char)s);
+}
+inline void pxln(const std::string_view sv)
+{
+	for (auto s: sv)
+		printf("%02x", (unsigned char)s);
+	printf("\n");
+}
+template<typename O>
+inline void px(O & o, const std::string_view sv)
+{
+	auto s = o.rdstate();
+	for (auto s: sv)
+		o << std::setw(2) << std::setfill('0') << std::hex << (unsigned(s)&0xff) << std::dec;
+	o.setstate(s);
+}
+template<typename O>
+inline void pxln(O & o, const std::string_view sv)
+{
+	auto s = o.rdstate();
+	for (auto s: sv)
+		o << std::setw(2) << std::setfill('0') << std::hex << (unsigned(s)&0xff) << std::dec;
+	o << std::endl;
+	o.setstate(s);
+}
+
+template< class T>
+inline T ror( T v, unsigned int shift)
+{
+	auto lshift = sizeof(v)*8 - shift;
+	return (v >> shift) | (v << lshift);
+}
+template< class T>
+inline T rol( T v, unsigned int shift)
+{
+	auto rshift = sizeof(v)*8 - shift;
+	return (v << shift) | (v >> rshift);
+}
+
+
+struct sha256_padding
+{
+	inline static const size_t min_size = 9;
+
+	size_t padding_size;
+	unsigned char padding[63+min_size];
+	sha256_padding()
+		: padding_size(min_size) // min size
+	{
+		padding[0] = 0x80;
+		memset((char*)padding+1, 0, 63);
+		//pxln(to_string_view());
+	}
+	sha256_padding(size_t s)
+	{
+		padding_size = 64 - (s%64);
+		if (padding_size < min_size)
+			padding_size += 64;
+
+		padding[0] = 0x80;
+		memset((char*)padding+1, 0, padding_size-min_size);
+
+		// serialize size big endian
+		s *= 8;
+		unsigned char * ptr = &padding[padding_size-1];
+		for (int i=0 ; i<8 ; i++,ptr--,s>>=8)
+			*ptr = s & 0xFF;
+	}
+	void set_data_size(size_t s)
+	{
+		size_t new_padding_size = 64 - (s%64);
+		if (new_padding_size < min_size)
+			new_padding_size += 64;
+		memset(padding+padding_size-8, 0, 8);
+		padding_size = new_padding_size;
+		// serialize size in bits, big endian
+		s *= 8;
+		unsigned char * ptr = &padding[padding_size-1];
+		for (int i=0 ; i<8 ; i++,ptr--,s>>=8)
+			*ptr = s & 0xFF;
+	}
+	std::string_view to_string_view() const
+	{
+		return std::string_view((char*)padding, padding_size);
+	}
+};
+
+struct svistreamN
+{
+	std::deque<std::string_view> svs;
+	size_t count;
+	bool eof_;
+	inline svistreamN(std::initializer_list<std::string_view> values)
+		: svs(values)
+		, eof_(false)
+	{
+		assert((std::accumulate(svs.begin(), svs.end(), 0, [](int x, const std::string_view & s) { return x+s.size(); }) % 64) == 0);
+		//for (const auto & s: svs)
+		//	px(s);
+		//std::cout << std::endl;
+	}
+	bool eof() const { return eof_; }
+	unsigned char get()
+	{
+		while ( ! svs.empty() && svs.front().empty())
+			svs.pop_front();
+		eof_ = svs.empty();
+		if (eof())
+			return 0;
+		unsigned char c = (unsigned char) svs.front().front();
+		svs.front().remove_prefix(1);
+		//std::cout << std::hex << std::setfill('0') << std::setw(2) << ((unsigned int)c) << std::dec;
+		return c;
+	}
+};
+
 struct Hash256
 {
+	inline static const sha256_padding padding_for_sha256 = sha256_padding((size_t)32);
+
 	union {
 		uint32_t hash_hash;
 		unsigned char h[32];
@@ -28,8 +153,11 @@ struct Hash256
 		return h[idx & 31];
 	}
 	inline Hash256& operator=(const Hash256 & other) {
-		memcpy(h, other.h, 32);
+		std::copy(other.h, other.h+32, h);
 		return *this;
+	}
+	std::string_view to_string_view() const {
+		return std::string_view((char*)h, 32);
 	}
 };
 
@@ -62,129 +190,15 @@ template<typename O>
 O & operator<<(O & out, const Hash256 & hash)
 {
 	std::ios_base::fmtflags f(out.flags());
-	for (int i=0 ; i<32 ; i++)
+	for (int i=31 ; i>=0 ; i--)
 		out << std::setw(2) << std::setfill('0') << std::hex << (int)hash[i] << std::dec;
 	out.flags(f);
 	return out;
 }
 
-inline void px(const std::string_view sv)
-{
-	for (auto s: sv)
-		printf("%02x", (unsigned char)s);
-}
-inline void pxln(const std::string_view sv)
-{
-	for (auto s: sv)
-		printf("%02x", (unsigned char)s);
-	printf("\n");
-}
-template<typename O>
-inline void px(O & o, const std::string_view sv)
-{
-	auto s = o.rdstate();
-	for (auto s: sv)
-		o << std::setw(2) << std::setfill('0') << std::hex << (unsigned(s)&0xff) << std::dec;
-	o.setstate(s);
-}
-template<typename O>
-inline void pxln(O & o, const std::string_view sv)
-{
-	auto s = o.rdstate();
-	for (auto s: sv)
-		o << std::setw(2) << std::setfill('0') << std::hex << (unsigned(s)&0xff) << std::dec;
-	o << std::endl;
-	o.setstate(s);
-}
-
 template<typename STREAM>
-struct SHA256PaddingStream
+void fill_sha256(Hash256 & result, STREAM & reader)
 {
-	STREAM & in;
-	size_t count;
-	size_t size;
-	inline SHA256PaddingStream(STREAM & i)
-		: in(i)
-		, count(0)
-		, size(0)
-	{}
-	inline bool eof() const { return count > size && (count%64) == 0; }
-	inline unsigned char next()
-	{
-		if ( ! in.eof())
-		{
-			unsigned char b = in.get();
-			if ( ! in.eof())
-			{
-				size++;
-				count++;
-				return (unsigned char)b;
-			}
-		}
-		
-		if (size == count) {
-			count++;
-			return 0x80;
-		}
-		
-		if (((size+1+8) % 64) < 8 && count-size < 8) {
-			count++;
-			return 0;
-		}
-		if (((count+8) % 64) >= 8) {
-			count++;
-			return 0;
-		}
-		count++;
-		return ((size*8) >> (8*(64-count))) & 0xFF;
-	}
-};
-
-struct svistream
-{
-	const std::string_view sv;
-	size_t count;
-	bool eof_;
-	inline svistream(const std::string & str)
-		: sv(str)
-		, count(0)
-		, eof_(false)
-	{}
-	inline svistream(const std::string_view sv_)
-		: sv(sv_)
-		, count(0)
-		, eof_(false)
-	{}
-	bool eof() const { return eof_; }
-	unsigned char get()
-	{
-		eof_ = count == sv.size();
-		if (eof())
-			return 0;
-		else
-			return (sv[count++] & 0xFF);
-	}
-};
-
-
-template< class T>
-inline T ror( T v, unsigned int shift)
-{
-	auto lshift = sizeof(v)*8 - shift;
-	return (v >> shift) | (v << lshift);
-}
-template< class T>
-inline T rol( T v, unsigned int shift)
-{
-	auto rshift = sizeof(v)*8 - shift;
-	return (v << shift) | (v >> rshift);
-}
-
-template<typename STREAM>
-void fill_sha256(Hash256 & result, STREAM & s)
-{
-	SHA256PaddingStream reader(s);
-	
 	unsigned int k[64] =
 	{
 		0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -208,13 +222,13 @@ void fill_sha256(Hash256 & result, STREAM & s)
 
 	for (;;)
 	{
+		unsigned int w[64];
+		//memset(w, 0, 64*4);
+		for (int i=0 ; i<16 ; i++)
+			w[i] = (reader.get() << 24) + (reader.get() << 16) + (reader.get() << 8) + reader.get();
+
 		if (reader.eof())
 			break;
-
-		unsigned int w[64];
-		memset(w, 0, 64*4);
-		for (int i=0 ; i<16 ; i++)
-			w[i] = (reader.next() << 24) + (reader.next() << 16) + (reader.next() << 8) + reader.next();
 
 		for (int i=16 ; i<64 ; i++)
 		{
@@ -297,9 +311,75 @@ void fill_sha256(Hash256 & result, STREAM & s)
 }
 
 void fill_dbl_sha256(Hash256 & h, std::string_view sv_)
+{	
+	thread_local sha256_padding padding;
+	padding.set_data_size(sv_.size());
+
+	svistreamN svi({sv_, padding.to_string_view()});
+	fill_sha256(h, svi);
+	//{
+	//	std::cout << h << std::endl;
+	//	svistreamN svi_tmp({h.to_string_view(), Hash256::padding_for_sha256.to_string_view()});
+	//	for (;;)
+	//	{
+	//		unsigned c = svi_tmp.get();
+	//		if (svi_tmp.eof())
+	//			break;
+	//		std::cout << std::hex << std::setfill('0') << std::setw(2) << (((unsigned int)c) & 0xFF) << std::dec;
+	//	}
+	//	std::cout << std::endl;
+	//}
+	svistreamN svi2({h.to_string_view(), Hash256::padding_for_sha256.to_string_view()});
+	fill_sha256(h, svi2);
+}
+
+void fill_merkle_root(Hash256 & h, const Hash256 & left, const Hash256 & right)
 {
-	svistream sv(sv_);
-	fill_sha256(h, sv);
-	svistream sv2(std::string_view((char*)h.h, 32));
+	thread_local sha256_padding padding;
+	padding.set_data_size(64);
+
+	svistreamN sv1({left.to_string_view(), right.to_string_view(), padding.to_string_view()});
+	fill_sha256(h, sv1);
+	svistreamN sv2({h.to_string_view(), Hash256::padding_for_sha256.to_string_view()});
 	fill_sha256(h, sv2);
+}
+
+void fill_merkle_root(Hash256 & mr, std::vector<Hash256> && tmp_hashes)
+{
+	if (tmp_hashes.size() == 1) {
+		mr = tmp_hashes[0];
+		return;
+	} if (tmp_hashes.size() == 2) {
+		return fill_merkle_root(mr, tmp_hashes[0], tmp_hashes[1]);
+	}
+
+	for (int i=0,j=0 ; i<tmp_hashes.size() ; i+=2,j++)
+	{
+		if (i == tmp_hashes.size()-1)
+			fill_merkle_root(tmp_hashes[j], tmp_hashes[i], tmp_hashes[i]);
+		else
+			fill_merkle_root(tmp_hashes[j], tmp_hashes[i], tmp_hashes[i+1]);
+	}
+	tmp_hashes.resize((tmp_hashes.size()+1)/2);
+	return fill_merkle_root(mr, std::move(tmp_hashes));
+}
+void fill_merkle_root(Hash256 & mr, const std::vector<std::reference_wrapper<const Hash256>> & hashes)
+{
+	if (hashes.size() == 1) {
+		mr = hashes[0];
+		return;
+	} if (hashes.size() == 2) {
+		return fill_merkle_root(mr, hashes[0], hashes[1]);
+	}
+
+	std::vector<Hash256> tmp_hashes;
+	for (int i=0 ; i<hashes.size() ; i+=2)
+	{
+		tmp_hashes.emplace_back();
+		if (i == hashes.size()-1)
+			fill_merkle_root(tmp_hashes.back(), hashes[i], hashes[i]);
+		else
+			fill_merkle_root(tmp_hashes.back(), hashes[i], hashes[i+1]);
+	}
+	return fill_merkle_root(mr, std::move(tmp_hashes));
 }

@@ -87,8 +87,9 @@ std::uint32_t calculate_checksum(unsigned char * data, size_t len)
 {
 	Hash256 hash;
 	fill_dbl_sha256(hash, std::string_view((char*)data, len));
-	std::string_view sv((char*)hash.h, 4);
-	return consume_little_endian<std::uint32_t>(sv);
+	return hash.hash_hash;
+	//std::string_view sv((char*)hash.h, 4);
+	//return consume_little_endian<std::uint32_t>(sv);
 }
 
 bool recv_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::mutable_buffer buffer, std::chrono::seconds timeout)
@@ -224,6 +225,7 @@ transaction consume_tx(std::string_view & data)
 
 	tx.has_witness = false;
 	if (data.data()[0] == 0) {
+		std::cout << "has witness" << std::endl;
 		tx.has_witness = true;
 		data.remove_prefix(2);
 	}
@@ -338,7 +340,10 @@ struct message
 		}
 
 		if (checksum != calculate_checksum((unsigned char*)body.data(), len))
-			std::cout << "Bad checksum for command " << command << std::endl;
+			std::cout << "Bad checksum for command " << command << " "
+			          << std::hex << checksum
+			          << " instead of " << calculate_checksum((unsigned char*)body.data(), len)
+			          << std::dec << std::endl;
 
 		return true;
 	}
@@ -762,7 +767,7 @@ struct network
 				std::cout << "Bad peer chosen" << std::endl;
 				continue;
 			}
-			if (bc->height() == 0)
+			if (bc->best_height() == blockchain::no_height)
 			{
 				bool rcvd;
 				message genesis_block_msg;
@@ -781,13 +786,13 @@ struct network
 				}
 			}
 		}
-		if (bc->height() == 0)
+		if (bc->best_height() == blockchain::no_height)
 		{
 			std::cout << "Failed to get the genesis block" << std::endl;
 			return;
 		}
 
-		std::cout << "Synching from block height " << bc->height() << std::endl;
+		std::cout << "Synching from block height " << bc->best_height() << std::endl;
 		for (int i=0 ; i<conf->min_peer_count ;)
 		{
 			auto peer = select_peer();
@@ -845,6 +850,7 @@ struct network
 	}
 	bool process_block_msg(const message & msg, const Hash256 & supposed_block_hash)
 	{
+		//std::cout << "msg: " << std::hex << msg << std::dec << std::endl;
 		std::string_view data(msg.body.data(), msg.body.size());
 
 		if (data.size() < 81)
@@ -877,8 +883,28 @@ struct network
 		std::cout << "Block hash: " << std::hex << hash << std::dec << std::endl;
 
 		auto ntx = consume_var_int(data);
+		std::vector<Hash256> txids;
+		txids.reserve(ntx);
 		for (int i=0 ; i<ntx ; i++)
+		{
+			const char * tx_begin = data.data();
 			bl.txs.push_back(consume_tx(data));
+			const char * tx_end = data.data();
+			std::string_view tx_sv((char*)tx_begin, std::distance(tx_begin, tx_end));
+			//pxln(tx_sv);
+			txids.emplace_back();
+			fill_dbl_sha256(txids.back(), tx_sv);
+			std::cout << std::hex << txids.back() << std::dec << std::endl;
+		}
+
+		Hash256 merkle_root;
+		fill_merkle_root(merkle_root, std::move(txids));
+		std::cout << "Block merkle root     : " << std::hex << bl.merkle_root << std::dec << std::endl;
+		std::cout << "Calculated merkle root: " << std::hex << merkle_root << std::dec << std::endl;
+		if (bl.merkle_root != merkle_root) {
+			std::cout << "======================================================================================================================" << std::endl << std::endl << std::endl;
+			exit(-1);
+		}
 		//std::cout << "ntx: " << ntx << std::endl;
 		//if (ntx > 1)
 		//	for (int i=0 ; i<ntx ; i++)
