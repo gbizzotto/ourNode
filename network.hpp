@@ -550,8 +550,10 @@ struct peer : std::enable_shared_from_this<peer>
 		expected_messages.emplace(msg_type, boost::fibers::promise<message>());
 		auto deadline = std::chrono::system_clock::now() + timeout;
 		auto future = expected_messages[msg_type].get_future();
-		if (future.wait_until(deadline) != boost::fibers::future_status::ready)
+		if (future.wait_until(deadline) != boost::fibers::future_status::ready) {
+			expected_messages.erase(msg_type);
 			return {false,{}};
+		}
 		message m = std::move(future.get());
 		expected_messages.erase(msg_type);
 		return {true,std::move(m)};
@@ -809,12 +811,16 @@ struct network
 				std::vector<std::tuple<block,Hash256>> headers = process_headers_msg(headers_msg);
 				for (std::tuple<block,Hash256> & p : headers)
 				{
-					if (bc->has(std::get<1>(p)))
-						continue;
-					bool rcvd;
-					message genesis_block_msg;
-					std::tie(rcvd,genesis_block_msg) = peer->get_block(std::get<1>(p));
-					process_block_msg(genesis_block_msg, std::get<1>(p));
+					for (;;)
+					{
+						if (bc->has(std::get<1>(p)))
+							break;
+						bool rcvd;
+						message block_msg;
+						std::tie(rcvd,block_msg) = peer->get_block(std::get<1>(p));
+						if (rcvd && process_block_msg(block_msg, std::get<1>(p)))
+							break;
+					}
 				}
 				auto & new_last_known_hash = bc->get_last_known_block_hash();
 				if (new_last_known_hash == last_known_hash)
