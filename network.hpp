@@ -1,6 +1,7 @@
 
 #pragma once
 
+#include <unordered_set>
 #include <cstring>
 #include <boost/asio.hpp>
 #include <boost/fiber/all.hpp>
@@ -370,8 +371,10 @@ std::ostream & operator<<(std::ostream & out, const message & m)
 	return out;
 }
 
-struct peer : std::enable_shared_from_this<peer>
+template<typename network>
+struct peer : std::enable_shared_from_this<peer<network>>
 {
+	network & net;
 	boost::asio::ip::tcp::socket socket;
 
 	bool handshaken;
@@ -392,8 +395,9 @@ struct peer : std::enable_shared_from_this<peer>
 	std::string   peer_user_agent;
 	int32_t       peer_block_height;
 
-	peer(boost::asio::io_context & io_context, config::peer peer_config_, utttil::synchronized<ournode::config> & conf_)
-		: socket(io_context)
+	peer(network & net_, config::peer peer_config_, utttil::synchronized<ournode::config> & conf_)
+		: net(net_)
+		, socket(*net_.io_context)
 		, handshaken(false)
 		, error(false)
 		, nonce((((uint64_t)rand()) << 32) + rand())
@@ -442,6 +446,17 @@ struct peer : std::enable_shared_from_this<peer>
 					std::cout << "Coudln't connect to " << peer_config.ip << " " << peer_config.port << std::endl;
 				}
 			});
+
+		//update_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch,
+		//	[this](){
+		//		while( ! handshaken && ! error)
+		//			boost::this_fiber::sleep_for(std::chrono::seconds(1));
+		//		while ( ! error)
+		//		{
+		//			
+		//			boost::this_fiber::sleep_for(std::chrono::milliseconds(1));
+		//		}
+		//	});
 
 		// message loop
 		while( ! error) {
@@ -523,6 +538,20 @@ struct peer : std::enable_shared_from_this<peer>
 
 		m.send(socket);
 	}
+	void send_getblocks_msg(const Hash256 & last_known_hash)
+	{
+		Hash256 zero_hash;
+		zero_hash.zero();
+
+		message m("getblocks");
+
+		m.append_little_endian(g_version);
+		m.append_var_int(1);
+		m.append_bytes(last_known_hash.h, 32);
+		m.append_bytes(zero_hash.h, 32);
+
+		m.send(socket);
+	}
 
 	bool expect_many(const std::vector<std::string> msg_types, std::chrono::seconds timeout)
 	{
@@ -589,8 +618,6 @@ struct peer : std::enable_shared_from_this<peer>
 
 		//else if (std::strcmp(&header[4], "headers") == 0)
 		//	process_headers_msg(std::string_view(body.get(), len));
-		//else if (std::strcmp(&header[4], "inv") == 0)
-		//	process_inv_msg(std::string_view(buf, len));
 		//else if (std::strcmp(&header[4], "block") == 0)
 		//	process_block_msg(std::string_view(buf, len));
 
@@ -661,10 +688,15 @@ struct peer : std::enable_shared_from_this<peer>
 		send_getheaders_msg(last_known_hash);
 		return expect("headers");
 	}
-	std::tuple<bool,message> get_block(const Hash256 & block_hash)
+	std::tuple<bool,message> get_block(const Hash256 & block_hash, std::chrono::seconds timeout=std::chrono::seconds(60))
 	{
 		send_block_getdata_msg(block_hash);
-		return expect("block");
+		return expect("block", timeout);
+	}
+	std::tuple<bool,message> get_next_blocks_inv(const Hash256 & last_block_hash)
+	{
+		send_getblocks_msg(last_block_hash);
+		return expect("inv");
 	}
 };
 
@@ -673,12 +705,14 @@ struct network
 	utttil::synchronized<ournode::config> & conf;
 	utttil::synchronized<ournode::blockchain> & bc;
 
+	std::deque<Hash256> missing_blocks;
+
+	std::vector<std::shared_ptr<peer<network>>> handshaken_peers;
+	bool error;
+
 	std::shared_ptr<boost::asio::io_context> io_context;
 	boost::fibers::fiber keep_well_connected_fiber;
 	boost::fibers::fiber keep_up_to_date_fiber;
-
-	std::vector<std::shared_ptr<peer>> handshaken_peers;
-	bool error;
 
 	network(utttil::synchronized<ournode::config> & conf_, utttil::synchronized<ournode::blockchain> & bc_)
 		: conf(conf_)
@@ -708,7 +742,7 @@ struct network
 		std::set<config::peer> untried_peers  = conf.lock()->known_peers;
 		std::set<config::peer> rejected_peers = conf.lock()->rejected_peers;
 
-		std::vector<std::shared_ptr<peer>> trying_peers;
+		std::vector<std::shared_ptr<peer<network>>> trying_peers;
 		trying_peers.reserve(min_peer_count * parallel_connection_ratio);
 
 		for (;;)
@@ -725,12 +759,12 @@ struct network
 				size_t needed_tries = (min_peer_count - handshaken_peers.size()) * parallel_connection_ratio;
 				while (trying_peers.size() < needed_tries && ! untried_peers.empty())
 				{
-					auto p = std::make_shared<peer>(*io_context, *untried_peers.begin(), conf);
+					auto p = std::make_shared<peer<network>>(*this, *untried_peers.begin(), conf);
 					untried_peers.erase(untried_peers.begin());
 					trying_peers.push_back(p);
 					p->start();
 				}
-			}			
+			}
 			boost::this_fiber::sleep_for(std::chrono::seconds(1));
 			std::erase_if(trying_peers, [&](const auto & p)
 				{
@@ -750,10 +784,16 @@ struct network
 		}
 	}
 
-	std::shared_ptr<peer> select_peer()
+	std::shared_ptr<peer<network>> select_peer()
 	{
 		// Random for now. How about a round robin here?
-		return *std::next(handshaken_peers.begin(), rand() % handshaken_peers.size());
+		auto p = *std::next(handshaken_peers.begin(), rand() % handshaken_peers.size());
+		while ( ! p || p->error)
+		{
+			boost::this_fiber::sleep_for(std::chrono::microseconds(1));
+			p = *std::next(handshaken_peers.begin(), rand() % handshaken_peers.size());
+		}
+		return p;
 	}
 
 	void keep_up_to_date()
@@ -762,75 +802,117 @@ struct network
 			boost::this_fiber::sleep_for(std::chrono::milliseconds(1));
 
 		// initial sync
-		for (int i=0 ; i<conf->min_peer_count ; i++)
-		{
-			auto peer = select_peer();
-			if ( ! peer || peer->error) {
-				std::cout << "Bad peer chosen" << std::endl;
-				continue;
-			}
-			if (bc->best_height() == blockchain::no_height)
-			{
-				bool rcvd;
-				message genesis_block_msg;
-				std::tie(rcvd,genesis_block_msg) = peer->get_block(blockchain::testnet_genesis_block_hash);
-				if ( ! rcvd)
-					continue;
-				try
-				{
-					if (process_block_msg(genesis_block_msg, blockchain::testnet_genesis_block_hash))
-						break;
-				}
-				catch (const std::exception & e)
-				{
-					const boost::stacktrace::stacktrace* st = boost::get_error_info<traced>(e);
-					break;
-				}
-			}
-		}
 		if (bc->best_height() == blockchain::no_height)
-		{
-			std::cout << "Failed to get the genesis block" << std::endl;
-			return;
-		}
+			missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
+		synchronize_blockchain();
+	}
+	
+	std::shared_ptr<peer<network>> steal_handshaken_peer()
+	{
+		while (handshaken_peers.empty())
+			boost::this_fiber::sleep_for(std::chrono::milliseconds(100));
+		auto p = handshaken_peers.back();
+		handshaken_peers.pop_back();
+		return p;
+	}
 
-		std::cout << "Synching from block height " << bc->best_height() << std::endl;
-		for (int i=0 ; i<conf->min_peer_count ;)
-		{
-			auto peer = select_peer();
-			auto & last_known_hash = bc->get_last_known_block_hash();
-			bool rcvd;
-			message headers_msg;
-			std::tie(rcvd,headers_msg) = peer->get_headers(last_known_hash);
-			if ( ! rcvd) {
-				++i;
-				continue;
-			}
-			try
-			{
-				std::vector<std::tuple<block,Hash256>> headers = process_headers_msg(headers_msg);
-				for (std::tuple<block,Hash256> & p : headers)
+	void synchronize_blockchain()
+	{
+		auto get_block_hashes_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch,
+			[&]() {
+				for (int i=0 ; i<10 ; i++)
 				{
-					for (;;)
+					auto p = steal_handshaken_peer();
+					bool rcvd = true;
+					message inv_msg;
+					while(rcvd)
 					{
-						if (bc->has(std::get<1>(p)))
+						if ( ! missing_blocks.empty())
+							std::tie(rcvd,inv_msg) = p->get_next_blocks_inv(missing_blocks.back());
+						else if (bc->best_height() != blockchain::no_height)
+							std::tie(rcvd,inv_msg) = p->get_next_blocks_inv(bc->get_last_known_block_hash());
+						else
+							std::tie(rcvd,inv_msg) = p->get_next_blocks_inv(blockchain::testnet_genesis_block_hash);
+						if ( ! rcvd)
+							break; // choose another peer
+						try {
+							size_t missing_blocks_count = missing_blocks.size();
+							process_inv_msg(inv_msg);
+							if (missing_blocks.size() - missing_blocks_count < 500)
+								break; // didn't get 500 new blocks, this peer knows nothing, try another one
+							i = 0; // we got a full page of block hashes, we're far from being done
+						} catch (const std::exception & e) {
 							break;
-						bool rcvd;
-						message block_msg;
-						std::tie(rcvd,block_msg) = peer->get_block(std::get<1>(p));
-						if (rcvd && process_block_msg(block_msg, std::get<1>(p)))
-							break;
+						}
 					}
 				}
-				auto & new_last_known_hash = bc->get_last_known_block_hash();
-				if (new_last_known_hash == last_known_hash)
-					++i;
-			}
-			catch (std::exception & e)
-			{}
-		}
+			});
 
-		// all up-to-date
+		boost::fibers::fiber get_blocks_fibers[12];
+		for (auto & f : get_blocks_fibers)
+			f = boost::fibers::fiber([&]()
+					{
+						std::cout << "Getblock fiber" << std::endl;
+						std::chrono::seconds timeout(60);
+						for (int i=0 ; i<10 ; i++)
+						{
+							auto p = steal_handshaken_peer();
+							std::cout << "Getblock fiber got peer" << std::endl;
+							// if we can't get a block every 60s, we'll nevet get that full blockchain
+							auto deadline = std::chrono::system_clock::now() + timeout;
+							while(std::chrono::system_clock::now() < deadline)
+							{
+								if (missing_blocks.empty())
+								{
+									boost::this_fiber::sleep_for(std::chrono::milliseconds(1));
+									continue;
+								}
+								Hash256 h = missing_blocks.front();
+								std::cout << "Getblock fiber get block " << h << std::endl;
+								missing_blocks.pop_front();
+								bool rcvd = true;
+								message msg;
+								std::tie(rcvd, msg) = p->get_block(h, timeout);
+								if ( ! rcvd)
+									missing_blocks.push_front(h);
+								else
+								{
+									deadline = std::chrono::system_clock::now() + timeout;
+									if ( ! process_block_msg(msg, h))
+										missing_blocks.push_front(h);
+								}
+							}
+
+						}
+					}
+				);
+
+		get_block_hashes_fiber.join();
+		for (auto & f : get_blocks_fibers)
+			f.join();
+	}
+
+	void process_inv_msg(const message & msg)
+	{
+		std::string_view data(msg.body.data(), msg.body.size());
+
+		size_t ninv = consume_var_int(data);
+		for (size_t i=0 ; i<ninv ; i++)
+		{
+			std::uint32_t type = consume_little_endian<decltype(type)>(data);
+			Hash256 h;
+			consume_bytes(data, (char*)h.h, 32);
+			switch(type)
+			{
+				case MSG_BLOCK:
+					if (bc->has(h))
+						continue;
+					if (std::find(missing_blocks.begin(), missing_blocks.end(), h) != missing_blocks.end())
+						continue;
+					missing_blocks.push_back(h);
+					break;
+			}
+		}
 	}
 
 	std::vector<std::tuple<block,Hash256>> process_headers_msg(const message & msg)
@@ -859,65 +941,67 @@ struct network
 		//std::cout << "msg: " << std::hex << msg << std::dec << std::endl;
 		std::string_view data(msg.body.data(), msg.body.size());
 
-		if (data.size() < 81)
-		{
-			std::cout << "BLOCK DROPPED: block was truncated." << std::endl;
-			return false;
-		}
-
-		// std::string block_hash = dbl_sha256({data.data(), 80});
-		// std::reverse(block_hash.begin(), block_hash.end());
-		// pxln(block_hash.data(), 32);
-
-		// unsigned char * announced_previous_block_hash = (unsigned char*)data.data()+4;
-		// if ( ! bc.is_block_hash_close_to_tip(announced_previous_block_hash))
-		// {
-		// 	std::cout << "BLOCK DROPPED: previous block not in cache." << std::endl;
-		// 	return;
-		// }
-
 		block bl;
 		Hash256 hash;
-		std::tie(bl, hash) = consume_header(data, false);
 
-		if (hash != supposed_block_hash) {
-			std::cout << "Was expecting " << supposed_block_hash
-			          << ", got " << hash << std::endl;
+		try { // parsing might throw
+			// std::string block_hash = dbl_sha256({data.data(), 80});
+			// std::reverse(block_hash.begin(), block_hash.end());
+			// pxln(block_hash.data(), 32);
+
+			// unsigned char * announced_previous_block_hash = (unsigned char*)data.data()+4;
+			// if ( ! bc.is_block_hash_close_to_tip(announced_previous_block_hash))
+			// {
+			// 	std::cout << "BLOCK DROPPED: previous block not in cache." << std::endl;
+			// 	return;
+			// }
+
+			std::tie(bl, hash) = consume_header(data, false);
+
+			if (hash != supposed_block_hash) {
+				std::cout << "Was expecting " << supposed_block_hash
+						<< ", got " << hash << std::endl;
+				return false;
+			}
+
+			auto ntx = consume_var_int(data);
+			std::vector<Hash256> txids;
+			txids.reserve(ntx);
+			for (int i=0 ; i<ntx ; i++)
+			{
+				const char * tx_begin = data.data();
+				bl.txs.push_back(consume_tx(data));
+				const char * tx_end = data.data();
+				std::string_view tx_sv((char*)tx_begin, std::distance(tx_begin, tx_end));
+				//pxln(tx_sv);
+				txids.emplace_back();
+				fill_dbl_sha256(txids.back(), tx_sv);
+				std::cout << std::hex << txids.back() << std::dec << std::endl;
+			}
+
+			Hash256 merkle_root;
+			fill_merkle_root(merkle_root, std::move(txids));
+			if (bl.merkle_root != merkle_root) {
+				std::cout << "Invalid merkle root: " << std::endl
+				          << "Block merkle root     : " << std::hex << bl.merkle_root << std::dec << std::endl
+				          << "Calculated merkle root: " << std::hex << merkle_root << std::dec << std::endl;
+				return false;
+			}
+			//std::cout << "ntx: " << ntx << std::endl;
+			//if (ntx > 1)
+			//	for (int i=0 ; i<ntx ; i++)
+			//		std::cout << "tx " << i << std::endl
+			//				<< bl.txs[i] << std::endl;
+
+		} catch (std::exception & e) {
 			return false;
 		}
 
-		std::cout << "Block hash: " << std::hex << hash << std::dec << std::endl;
+		std::cout << "Got block: " << std::hex << bl.prev_block_hash << " <- " << hash << std::dec << std::endl;
+		std::cout << bc->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
 
-		auto ntx = consume_var_int(data);
-		std::vector<Hash256> txids;
-		txids.reserve(ntx);
-		for (int i=0 ; i<ntx ; i++)
-		{
-			const char * tx_begin = data.data();
-			bl.txs.push_back(consume_tx(data));
-			const char * tx_end = data.data();
-			std::string_view tx_sv((char*)tx_begin, std::distance(tx_begin, tx_end));
-			//pxln(tx_sv);
-			txids.emplace_back();
-			fill_dbl_sha256(txids.back(), tx_sv);
-			std::cout << std::hex << txids.back() << std::dec << std::endl;
-		}
-
-		Hash256 merkle_root;
-		fill_merkle_root(merkle_root, std::move(txids));
-		std::cout << "Block merkle root     : " << std::hex << bl.merkle_root << std::dec << std::endl;
-		std::cout << "Calculated merkle root: " << std::hex << merkle_root << std::dec << std::endl;
-		if (bl.merkle_root != merkle_root) {
-			std::cout << "======================================================================================================================" << std::endl << std::endl << std::endl;
-			exit(-1);
-		}
-		//std::cout << "ntx: " << ntx << std::endl;
-		//if (ntx > 1)
-		//	for (int i=0 ; i<ntx ; i++)
-		//		std::cout << "tx " << i << std::endl
-		//				<< bl.txs[i] << std::endl;
-
-		return bc->add(std::move(bl), hash);
+		bc->add(std::move(bl), hash);
+		return true;
 	}
 };
 
