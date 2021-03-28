@@ -383,7 +383,6 @@ struct peer : std::enable_shared_from_this<peer<network>>
 	config::peer peer_config;
 	utttil::synchronized<ournode::config> & conf;
 
-	boost::fibers::fiber handshake_fiber;
 	std::map<std::string, boost::fibers::promise<message>> expected_messages;
 
 	// peer's info
@@ -404,11 +403,6 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		, peer_config(std::move(peer_config_))
 		, conf(conf_)
 	{}
-	~peer()
-	{
-		if (handshake_fiber.joinable())
-			handshake_fiber.join();
-	}
 
 	const config::peer & get_config() const { return peer_config; }
 
@@ -434,18 +428,18 @@ struct peer : std::enable_shared_from_this<peer<network>>
 			return;
 
 		// handshake
-		handshake_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch,
-			[this](){
-				send_version_msg();
-				handshaken = expect_many({"version","verack"}, std::chrono::seconds(5));
-				error &= ! handshaken;
-				if (handshaken) {
-					std::cout << "Connected to " << peer_config.ip << " " << peer_config.port << std::endl;
-					message("getaddr").send(socket);
+		boost::fibers::fiber(boost::fibers::launch::dispatch,
+			[self=this->shared_from_this()](){
+				self->send_version_msg();
+				self->handshaken = self->expect_many({"version","verack"}, std::chrono::seconds(5));
+				self->error &= ! self->handshaken;
+				if (self->handshaken) {
+					std::cout << "Connected to " << self->peer_config.ip << " " << self->peer_config.port << std::endl;
+					message("getaddr").send(self->socket);
 				} else {
-					std::cout << "Coudln't connect to " << peer_config.ip << " " << peer_config.port << std::endl;
+					std::cout << "Coudln't connect to " << self->peer_config.ip << " " << self->peer_config.port << std::endl;
 				}
-			});
+			}).detach();
 
 		//update_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch,
 		//	[this](){
@@ -474,7 +468,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		boost::fibers::future<bool> future(promise.get_future());
 		
 		//std::cout << "Trying " << peer_config.ip << " " << peer_config.port << std::endl;
-		socket.async_connect(endpoint, [promise=std::move(promise)](boost::system::error_code ec) mutable {
+		socket.async_connect(endpoint, [self=this->shared_from_this(),promise=std::move(promise)](boost::system::error_code ec) mutable {
 				promise.set_value(!ec);
 			});
 		if (future.wait_for(std::chrono::seconds(5)) != boost::fibers::future_status::ready) {
@@ -766,8 +760,36 @@ struct network
 				}
 			}
 			boost::this_fiber::sleep_for(std::chrono::seconds(1));
+			
+			// an inefficient erase_if
+			//for (int i=0 ; i<trying_peers.size() ; )
+			//{
+			//	auto & p = trying_peers[i];
+			//	bool remove = false;
+			//	if ( ! p)
+			//		remove = true;
+			//	if (p->error) {
+			//		//std::cout << "Rejecting " << p->get_config().ip << " " << p->get_config().port << std::endl;
+			//		rejected_peers.insert(p->get_config());
+			//		untried_peers.erase(p->get_config());
+			//		remove = true;
+			//	} else if (p->got_handshake()) {
+			//		handshaken_peers.push_back(p);
+			//		untried_peers.erase(p->get_config());
+			//		remove = true;
+			//	}
+			//	if (remove)
+			//	{
+			//		std::swap(trying_peers[i], trying_peers.back());
+			//		trying_peers.pop_back();
+			//	}
+			//	else
+			//		i++;
+			//}
 			std::erase_if(trying_peers, [&](const auto & p)
 				{
+					if ( ! p)
+						return true;
 					if (p->error) {
 						//std::cout << "Rejecting " << p->get_config().ip << " " << p->get_config().port << std::endl;
 						rejected_peers.insert(p->get_config());
@@ -802,8 +824,8 @@ struct network
 			boost::this_fiber::sleep_for(std::chrono::milliseconds(1));
 
 		// initial sync
-		if (bc->best_height() == blockchain::no_height)
-			missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
+		//if (bc->best_height() == blockchain::no_height)
+		//	missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
 		synchronize_blockchain();
 	}
 	
@@ -820,7 +842,7 @@ struct network
 	{
 		auto get_block_hashes_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch,
 			[&]() {
-				for (int i=0 ; i<10 ; i++)
+				for (int i=0 ; i<100 ; i++)
 				{
 					auto p = steal_handshaken_peer();
 					bool rcvd = true;
@@ -831,8 +853,10 @@ struct network
 							std::tie(rcvd,inv_msg) = p->get_next_blocks_inv(missing_blocks.back());
 						else if (bc->best_height() != blockchain::no_height)
 							std::tie(rcvd,inv_msg) = p->get_next_blocks_inv(bc->get_last_known_block_hash());
-						else
+						else {
+							missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
 							std::tie(rcvd,inv_msg) = p->get_next_blocks_inv(blockchain::testnet_genesis_block_hash);
+						}
 						if ( ! rcvd)
 							break; // choose another peer
 						try {
@@ -848,12 +872,12 @@ struct network
 				}
 			});
 
-		boost::fibers::fiber get_blocks_fibers[12];
+		boost::fibers::fiber get_blocks_fibers[50];
 		for (auto & f : get_blocks_fibers)
 			f = boost::fibers::fiber([&]()
 					{
 						std::cout << "Getblock fiber" << std::endl;
-						std::chrono::seconds timeout(60);
+						std::chrono::seconds timeout(10);
 						for (int i=0 ; i<10 ; i++)
 						{
 							auto p = steal_handshaken_peer();
@@ -1001,6 +1025,9 @@ struct network
 		std::cout << bc->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
 
 		bc->add(std::move(bl), hash);
+
+		bc->print(0);
+
 		return true;
 	}
 };

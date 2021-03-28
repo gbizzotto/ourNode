@@ -106,19 +106,18 @@ struct block_hash_map
 	Hash256 last_block_hash;
 
 	block_hash_map()
-		: bits(0xFF)
+		: bits(0xFF) // start with any 2^n-1
 		, index_by_hash_hash((bits+1)*2, no_height)
 	{
 		last_block_hash.zero();
 	}
 
-	void merge_nocheck(block_hash_map & other)
+	void merge_nocheck(block_hash_map && other)
 	{
-		while (size()+other.size() > bits)
-			double_size();
+		accomodate_new_size(size()+other.size());
 		for (int i=0 ; i<other.blocks.size()-1 ; i++)
-			index_by_hash_hash[index_slot(other.blocks[i], other.blocks[i+1].prev_block_hash)] = i;
-		index_by_hash_hash[index_slot(other.blocks[other.blocks.size()-1], other.last_block_hash)] = other.blocks.size()-1;
+			add_nocheck(std::move(other.blocks[i]), other.blocks[i+1].prev_block_hash);
+		add_nocheck(std::move(other.blocks[other.blocks.size()-1]), other.last_block_hash);
 	}
 
 	inline size_t size() const { return blocks.size(); }
@@ -141,15 +140,18 @@ struct block_hash_map
 	}
 	inline void add_nocheck(block && b, const Hash256 & block_hash)
 	{
-		if (size() > bits)
-			double_size();
+		accomodate_new_size(size()+1);
 		index_by_hash_hash[index_slot(b, block_hash)] = blocks.size();
 		blocks.push_back(std::move(b));
 		last_block_hash = block_hash;
 	}
-	inline void double_size()
+	inline void accomodate_new_size(size_t new_size)
 	{
-		bits = bits*2 + 1;
+		bool resize = new_size > bits;
+		if ( ! resize)
+			return;
+		while(new_size > bits)
+			bits = bits*2 + 1; // keep it 2^n-1
 		index_by_hash_hash = index_list((bits+1)*2, no_height);
 		for (int i=0 ; i<blocks.size()-1 ; i++)
 			index_by_hash_hash[index_slot(blocks[i], blocks[i+1].prev_block_hash)] = i;
@@ -195,11 +197,28 @@ struct blockchain
 			{
 				if ( ! orphan->orphan_chains.empty())
 					std::cout << "orphan shouldn't have orphans" << std::endl;
-				root_chain.merge_nocheck(orphan->root_chain);
+				root_chain.merge_nocheck(std::move(orphan->root_chain));
 				for (auto & branch : orphan->branches)
 					branches.push_back(std::move(branch));
 				orphan_chains.erase(std::next(orphan_chains.begin(), i));
 				return check_root_vs_orphans();
+			}
+		}
+	}
+	void check_orphan_vs_orphans(std::unique_ptr<blockchain> & new_orphan)
+	{
+		for (int i=0 ; i<orphan_chains.size() ; i++)
+		{
+			auto & orphan = orphan_chains[i];
+			if (orphan->root_chain.by_height_nocheck(0).prev_block_hash == new_orphan->get_last_known_block_hash())
+			{
+				if ( ! orphan->orphan_chains.empty())
+					std::cout << "orphan shouldn't have orphans" << std::endl;
+				new_orphan->root_chain.merge_nocheck(std::move(orphan->root_chain));
+				for (auto & branch : orphan->branches)
+					new_orphan->branches.push_back(std::move(branch));
+				orphan_chains.erase(std::next(orphan_chains.begin(), i));
+				return check_orphan_vs_orphans(new_orphan);
 			}
 		}
 	}
@@ -214,13 +233,7 @@ struct blockchain
 			if (hash == testnet_genesis_block_hash || is_orphan)
 			{
 				root_chain.add_nocheck(std::move(bl), hash);
-				return;
-			}
-			else
-			{
-				std::cout << "Added as new orphan block line" << std::endl;
-				orphan_chains.push_back(std::make_unique<blockchain>());
-				orphan_chains.back()->add(std::move(bl), hash);
+				check_root_vs_orphans();
 				return;
 			}
 		}
@@ -269,15 +282,39 @@ struct blockchain
 			}
 		
 		std::cout << "Added as new orphan block line as orphan" << std::endl;
-		orphan_chains.push_back(std::make_unique<blockchain>());
-		orphan_chains.back()->add(std::move(bl), hash, true);
+		auto new_orphan = std::make_unique<blockchain>();
+		new_orphan->add(std::move(bl), hash, true);
+		check_orphan_vs_orphans(new_orphan);
+		orphan_chains.emplace_back(std::move(new_orphan));
 	}
-	size_t size()
+	size_t size() const
 	{
 		return root_chain.size()
 		     + std::accumulate(branches     .begin(), branches     .end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm){ return s+bhm->size(); })
 			 + std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm){ return s+bhm->size(); })
 			 ;
+	}
+
+	void print(int indent)
+	{
+		std::cout << std::string(2*indent, ' ') << "root chain " << root_chain.size() << std::endl;
+		//for (auto & block : root_chain.blocks)
+		//	std::cout << std::string(2*indent+2, ' ') << block.prev_block_hash << std::endl;
+		//if (root_chain.size() != 0)
+		//	std::cout << std::string(2*indent+2, ' ') << root_chain.get_last_known_block_hash() << std::endl;
+
+		//std::cout << std::string(2*indent, ' ') << "branch chains:" << std::endl;
+		//for (auto & branch : branches)
+		//	branch->print(indent+1);
+		//std::cout << std::string(2*indent, ' ') << "orphan chains:" << std::endl;
+		//for (auto & orphan : orphan_chains)
+		//	orphan->print(indent+1);
+		std::cout << std::string(2*indent, ' ')
+		          << std::accumulate(branches     .begin(), branches     .end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm){ return s+bhm->size(); })
+		          << " in " << branches.size() << " branched chains." << std::endl;
+		std::cout << std::string(2*indent, ' ')
+		          << std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm){ return s+bhm->size(); })
+		          << " in " << orphan_chains.size() << " orphan chains." << std::endl;
 	}
 };
 
