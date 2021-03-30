@@ -17,9 +17,18 @@ typedef boost::error_info<struct tag_stacktrace, boost::stacktrace::stacktrace> 
 #include "sha256sum.hpp"
 #include "blockchain.hpp"
 
+template<typename C>
+bool in(const typename C::value_type & t, const C & c)
+{
+	return std::find(std::begin(c), std::end(c), t) != std::end(c);
+}
+
 namespace ournode {
 
+// inv type
 #define MSG_BLOCK 2
+// node services
+#define NODE_NETWORK 1
 
 template<typename T>
 T consume_little_endian(std::string_view & data)
@@ -160,7 +169,7 @@ net_addr consume_net_addr(std::string_view & sv, bool has_time)
 		a.time = consume_little_endian<decltype(a.time)>(sv);
 	a.services = consume_little_endian<decltype(a.services)>(sv);
 	consume_bytes(sv, a.addr, 16);
-	a.port     = consume_little_endian<decltype(a.port    )>(sv);
+	a.port     = consume_big_endian<decltype(a.port    )>(sv);
 	return a; // counting of copy elision
 }
 
@@ -263,11 +272,14 @@ struct message
 	message() = default;
 	message(const std::string cmd)
 		: command(cmd)
+		, len(0)
 	{
 		serialize_little_endian((unsigned char*)header, g_testnet_magic_number);
 		std::strncpy((char*)&header[4], std::string(12,0).c_str(), 12);
 		std::strncpy((char*)&header[4], cmd.c_str(), 12);
 	}
+
+	size_t byte_count() const { return 24 + len; }
 
 	template<typename T>
 	void append_little_endian(T t)
@@ -357,7 +369,7 @@ struct message
 		serialize_little_endian((unsigned char*)&header[20], checksum);
 
 		return send_bytes(socket, boost::asio::buffer((char*)header, sizeof(header)), std::chrono::seconds(5))
-			&& send_bytes(socket, boost::asio::buffer(body.data(), len) , std::chrono::seconds(5));
+			&& send_bytes(socket, boost::asio::buffer(body.data(), len)             , std::chrono::seconds(5));
 	}
 };
 
@@ -374,14 +386,25 @@ std::ostream & operator<<(std::ostream & out, const message & m)
 template<typename network>
 struct peer : std::enable_shared_from_this<peer<network>>
 {
+	enum Status
+	{
+		Opening = 0,
+		Handshaken = 1,
+		Rejected = 2,
+		Timeout = 3,
+		Closed = 3,
+	};
+
 	network & net;
 	boost::asio::ip::tcp::socket socket;
 
-	bool handshaken;
-	bool error;
 	uint64_t nonce;
 	config::peer peer_config;
-	utttil::synchronized<ournode::config> & conf;
+	Status status;
+
+	// network stats
+	size_t bytes_rcvd = 0;
+	size_t bytes_sent = 0;
 
 	std::map<std::string, boost::fibers::promise<message>> expected_messages;
 
@@ -394,68 +417,71 @@ struct peer : std::enable_shared_from_this<peer<network>>
 	std::string   peer_user_agent;
 	int32_t       peer_block_height;
 
-	peer(network & net_, config::peer peer_config_, utttil::synchronized<ournode::config> & conf_)
+	peer(network & net_, config::peer peer_config_)
 		: net(net_)
 		, socket(*net_.io_context)
-		, handshaken(false)
-		, error(false)
 		, nonce((((uint64_t)rand()) << 32) + rand())
 		, peer_config(std::move(peer_config_))
-		, conf(conf_)
+		, status(Opening)
 	{}
 
 	const config::peer & get_config() const { return peer_config; }
+	operator config::peer() const { return peer_config; }
+	bool has(std::uint64_t services) const { return (services & peer_services) == services; }
 
 	void start()
 	{
-		boost::fibers::fiber([this](){
+		boost::fibers::fiber([self=this->shared_from_this()](){
 				try {
-					run();
+					self->run();
 				} catch (const std::exception & e) {
 					std::cout << "run() trew: " << e.what() << std::endl;
 					const boost::stacktrace::stacktrace* st = boost::get_error_info<traced>(e);
 					if (st) {
 						std::cerr << *st << '\n';
 					}
-					error = true;
+					self->socket.close();
+					self->status = Closed;
 				}
 			}).detach();
 	}
 
 	void run()
 	{
-		if ( !connect())
+		if ( !connect()) {
 			return;
+		}
+
+		std::cout << "Socket opened with " << peer_config.ip << " " << peer_config.port << std::endl;
 
 		// handshake
 		boost::fibers::fiber(boost::fibers::launch::dispatch,
 			[self=this->shared_from_this()](){
 				self->send_version_msg();
-				self->handshaken = self->expect_many({"version","verack"}, std::chrono::seconds(5));
-				self->error &= ! self->handshaken;
-				if (self->handshaken) {
-					std::cout << "Connected to " << self->peer_config.ip << " " << self->peer_config.port << std::endl;
-					message("getaddr").send(self->socket);
-				} else {
+				bool rcvd = self->expect_many({"version","verack"}, std::chrono::seconds(5));
+				if ( ! rcvd) {
 					std::cout << "Coudln't connect to " << self->peer_config.ip << " " << self->peer_config.port << std::endl;
+					self->status = Timeout;
+					return;
 				}
+				std::cout << "Hands shaken with " << self->peer_config.ip << " " << self->peer_config.port << std::endl;
+				self->send(message("getaddr"));
+				message addr;
+				std::tie(rcvd,addr) = self->expect("addr", std::chrono::seconds(10));
+				if ( ! rcvd) {
+					std::cout << "Didn't receive 'addr' msg from " << self->peer_config.ip << " " << self->peer_config.port << std::endl;
+					self->status = Timeout;
+					return;
+				}
+				std::cout << "Fully connected to " << self->peer_config.ip << " " << self->peer_config.port << std::endl;
+				self->status = Handshaken;
 			}).detach();
 
-		//update_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch,
-		//	[this](){
-		//		while( ! handshaken && ! error)
-		//			boost::this_fiber::sleep_for(std::chrono::seconds(1));
-		//		while ( ! error)
-		//		{
-		//			
-		//			boost::this_fiber::sleep_for(std::chrono::milliseconds(1));
-		//		}
-		//	});
-
 		// message loop
-		while( ! error) {
+		while(status == Opening || status == Handshaken) {
 			message m = recv_msg();
-			if (error) break;
+			if (status != Opening && status != Handshaken)
+				break;
 			handle_msg(std::move(m));
 		}
 	}
@@ -467,21 +493,34 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		boost::fibers::promise<bool> promise;
 		boost::fibers::future<bool> future(promise.get_future());
 		
-		//std::cout << "Trying " << peer_config.ip << " " << peer_config.port << std::endl;
 		socket.async_connect(endpoint, [self=this->shared_from_this(),promise=std::move(promise)](boost::system::error_code ec) mutable {
+				if (ec) {
+					self->status = Closed;
+					std::cout << "async_connect to " << self->peer_config.ip << ", ec: " << ec.message() << std::endl;
+				}
 				promise.set_value(!ec);
 			});
-		if (future.wait_for(std::chrono::seconds(5)) != boost::fibers::future_status::ready) {
-			socket.cancel();
-			error = true;
+		if (future.wait_for(std::chrono::seconds(5)) != boost::fibers::future_status::ready)
+		{
+			std::cout << "Timeout connecting to " << peer_config.ip << std::endl;
+			socket.close();
+			status = Timeout;
 			return false;
 		}
-		error = ! future.get();
-		return ! error;
+		return future.get();
 	}
-	bool got_handshake() const
+	bool send(message & m)
 	{
-		return handshaken;
+		if (m.send(socket)) {
+			bytes_sent     += m.byte_count();
+			net.bytes_sent += m.byte_count();
+			return true;
+		}
+		return false;
+	}
+	bool send(message && m)
+	{
+		return send(std::ref(m));
 	}
 
 	void send_version_msg()
@@ -501,7 +540,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		m.append_var_str(user_agent, sizeof(user_agent));
 		m.append_little_endian(start_height);
 
-		m.send(socket);
+		send(m);
 
 		//std::cout << "sent " << m.len << " bytes of -version- to " << peer_config.ip << " " << peer_config.port << std::endl;
 		//std::cout << std::hex << m << std::dec << std::endl;
@@ -520,7 +559,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		m.append_bytes(last_known_hash.h, 32);
 		m.append_bytes(zero_hash.h, 32);
 
-		m.send(socket);
+		send(m);
 	}
 	void send_block_getdata_msg(const Hash256 & last_known_hash)
 	{
@@ -530,7 +569,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		m.append_little_endian(std::uint32_t(MSG_BLOCK));
 		m.append_bytes(last_known_hash.h, 32);
 
-		m.send(socket);
+		send(m);
 	}
 	void send_getblocks_msg(const Hash256 & last_known_hash)
 	{
@@ -544,7 +583,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		m.append_bytes(last_known_hash.h, 32);
 		m.append_bytes(zero_hash.h, 32);
 
-		m.send(socket);
+		send(m);
 	}
 
 	bool expect_many(const std::vector<std::string> msg_types, std::chrono::seconds timeout)
@@ -585,8 +624,12 @@ struct peer : std::enable_shared_from_this<peer<network>>
 	const message recv_msg()
 	{
 		message result;
-		error = ! result.recv(this->socket, std::chrono::seconds(600));
-		//std::cout << "recvd " << result.len << " bytes of " << result.command << " from " << peer_config.ip << "  " << peer_config.port << std::endl;
+		if ( ! result.recv(this->socket, std::chrono::seconds(600))) {
+			status = Timeout;
+		} else {
+			bytes_rcvd     += result.byte_count();
+			net.bytes_rcvd += result.byte_count();
+		}
 		return result;
 	}
 
@@ -602,12 +645,14 @@ struct peer : std::enable_shared_from_this<peer<network>>
 			process_reject_msg(m);
 		else if (m.command == "verack")
 		{} // not much to do here
-		else if (m.command == "block")
-		{
+		else if (m.command == "block") {
+		}
+		else if (m.command == "inv") {
+			net.process_inv_msg(m);
 		}
 		else
 		{
-			std::cout << "Msg not handled: " << m.command << std::endl;
+			//std::cout << "Msg not handled: " << m.command << std::endl;
 		}
 
 		//else if (std::strcmp(&header[4], "headers") == 0)
@@ -636,7 +681,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		strncpy(reason_message.data(), sv.data(), reason_len);
 		sv.remove_prefix(reason_len);
 
-		std::cout << "Rejected " << rejected_message << ", because " << reason_message << std::endl;
+		std::cout << "Msg was rejected " << rejected_message << ", because " << reason_message << std::endl;
 	}
 
 	void process_version_msg(const message & m)
@@ -651,7 +696,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		peer_nonce       = consume_little_endian<decltype(peer_nonce)>(sv);
 		peer_user_agent  = consume_var_str(sv);
 
-		message("verack").send(socket);
+		send(message("verack"));
 	}
 
 	void process_addr_msg(const message & m)
@@ -660,7 +705,6 @@ struct peer : std::enable_shared_from_this<peer<network>>
 
 		auto naddr = consume_var_int(sv);
 		std::set<std::tuple<std::string,int>> known_peers_addresses;
-
 		for (int i=0 ; i<naddr ; i++)
 		{
 			net_addr net_address = consume_net_addr(sv, peer_version >= 31402);
@@ -671,9 +715,10 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		}
 
 		{
-			auto conf_proxy = conf.lock();
+			auto conf_proxy = net.conf.lock();
 			for (const auto & t : known_peers_addresses)
-				conf_proxy->add_known_peer_address(std::get<0>(t), std::get<1>(t));
+				conf_proxy->insert_peer(std::get<0>(t), std::get<1>(t));
+			//conf_proxy->save();
 		}
 	}
 
@@ -687,226 +732,350 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		send_block_getdata_msg(block_hash);
 		return expect("block", timeout);
 	}
-	std::tuple<bool,message> get_next_blocks_inv(const Hash256 & last_block_hash)
+	std::tuple<bool,message> get_next_blocks_inv(const Hash256 & last_block_hash, std::chrono::seconds timeout=std::chrono::seconds(60))
 	{
 		send_getblocks_msg(last_block_hash);
-		return expect("inv");
+		return expect("inv", timeout);
+		//for ( auto deadline = std::chrono::system_clock::now() + timeout
+		//    ; std::chrono::system_clock::now() < deadline
+		//	; )
+		//{
+		//	bool rcvd;
+		//	message msg;
+		//	std::tie(rcvd,msg) = expect("inv", timeout);
+		//	if (parse_prev_hash(msg) == last_block_hash)
+		//		return {rcvd,msg};
+		//}
+		//return {false,{}};
+	}
+};
+
+template<typename network>
+struct peer_manager
+{
+	network & net;
+
+	std::shared_ptr<boost::asio::io_context> io_context;
+
+	std::vector<std::shared_ptr<peer<network>>> trying_peers;
+	std::set<config::peer> silent_peers;
+	std::vector<std::shared_ptr<peer<network>>> handshaken_peers;
+
+	size_t current_get_peer = 0;
+
+	peer_manager(network & net_)
+		: net(net_)
+		, io_context(net_.io_context)
+	{}
+
+	void start()
+	{
+		boost::fibers::fiber([this](){ this->run(); }).detach();
+	}
+
+	void run()
+	{
+		for (;;boost::this_fiber::sleep_for(std::chrono::milliseconds(100)))
+		{
+			std::erase_if(trying_peers, [&](const auto & p)
+				{
+					if ( ! p)
+						return true;
+					if (p->status == peer<network>::Status::Rejected) {
+						std::cout << "Rejecting " << p->get_config().ip << " " << p->get_config().port << std::endl;
+						net.conf->reject_peer(p->get_config());
+						return true;
+					} else if (p->status == peer<network>::Status::Handshaken) {
+						std::cout << "Fully connected " << p->get_config().ip << " " << p->get_config().port << std::endl;
+						net.conf->trust_peer(p->get_config());
+						handshaken_peers.push_back(p);
+						return true;
+					} else if (p->status == peer<network>::Status::Timeout) {
+						std::cout << "Timed out " << p->get_config().ip << " " << p->get_config().port << std::endl;
+						silent_peers.insert(p->get_config());
+						return true;
+					} else if (p->status == peer<network>::Status::Closed) {
+						std::cout << "Closed " << p->get_config().ip << " " << p->get_config().port << std::endl;
+						return true;
+					}
+					return false;
+				});
+			std::erase_if(handshaken_peers, [&](const auto & p)
+				{
+					if ( ! p)
+						return true;
+					if (p->status == peer<network>::Status::Rejected) {
+						std::cout << "Rejecting " << p->get_config().ip << " " << p->get_config().port << std::endl;
+						net.conf->reject_peer(p->get_config());
+						return true;
+					} else if (p->status == peer<network>::Status::Timeout) {
+						std::cout << "Timed out " << p->get_config().ip << " " << p->get_config().port << std::endl;
+						return true;
+					} else if (p->status == peer<network>::Status::Closed) {
+						std::cout << "Closed " << p->get_config().ip << " " << p->get_config().port << std::endl;
+						return true;
+					}
+					return false;
+				});
+		}
+	}
+
+	config::peer get_peer_config()
+	{
+		auto in_ = [](const config::peer & cp, const std::vector<std::shared_ptr<peer<network>>> & c)
+			{
+				return std::find_if(std::begin(c), std::end(c), [&](const std::shared_ptr<peer<network>> & sptr)
+					{
+						return cp == (config::peer) *sptr;
+					}) != std::end(c);
+			};
+
+		auto config_proxy = net.conf.lock();
+		for (auto peer_config : config_proxy->trusted_peers)
+		{
+			if (in_(peer_config, trying_peers) || in(peer_config, silent_peers))
+				continue;
+			return peer_config;
+		}
+		for (auto peer_config : config_proxy->known_peers)
+		{
+			if (in_(peer_config, trying_peers) || in(peer_config, silent_peers))
+				continue;
+			return peer_config;
+		}
+		for (auto peer_config : silent_peers)
+		{
+			if (in_(peer_config, trying_peers))
+				continue;
+			return peer_config;
+		}
+		return {};
+	}
+
+	std::shared_ptr<peer<network>> get_peer()
+	{
+		auto parallel_connection_ratio = net.conf->parallel_connection_ratio;
+		current_get_peer++;
+		for (;;boost::this_fiber::sleep_for(std::chrono::milliseconds(10)))
+		{
+			if ( ! handshaken_peers.empty())
+			{
+				auto p = handshaken_peers.back();
+				handshaken_peers.pop_back();
+				current_get_peer--;
+				return p;
+			}
+			if (trying_peers.size() < current_get_peer * parallel_connection_ratio)
+			{
+				auto peer_conf = get_peer_config();
+				if ( ! peer_conf.port)
+				{
+					if (trying_peers.empty())
+					{
+						std::cout << "No more peers to connect to" << std::endl;
+						current_get_peer--;
+						return nullptr;
+					}
+					continue;
+				}
+				std::cout << "Trying " << peer_conf.ip << " " << peer_conf.port << std::endl;
+				auto p = std::make_shared<peer<network>>(net, peer_conf);
+				trying_peers.push_back(p);
+				p->start();
+			}
+		}
+	}
+
+	void return_peer(std::shared_ptr<peer<network>> p)
+	{
+		trying_peers.push_back(p); // peer needs evaluation
 	}
 };
 
 struct network
 {
+	std::shared_ptr<boost::asio::io_context> io_context;
 	utttil::synchronized<ournode::config> & conf;
 	utttil::synchronized<ournode::blockchain> & bc;
 
+	peer_manager<network> peer_manager_;
+	std::vector<std::shared_ptr<peer<network>>> peers;
+
 	std::deque<Hash256> missing_blocks;
 
-	std::vector<std::shared_ptr<peer<network>>> handshaken_peers;
-	bool error;
+	// network stats
+	size_t bytes_rcvd = 0;
+	size_t bytes_sent = 0;
 
-	std::shared_ptr<boost::asio::io_context> io_context;
 	boost::fibers::fiber keep_well_connected_fiber;
 	boost::fibers::fiber keep_up_to_date_fiber;
+	boost::fibers::fiber keep_printing_stats_fiber;
 
 	network(utttil::synchronized<ournode::config> & conf_, utttil::synchronized<ournode::blockchain> & bc_)
-		: conf(conf_)
+		: io_context(std::make_shared<boost::asio::io_context>())
+		, conf(conf_)
 		, bc(bc_)
+		, peer_manager_(*this)
 	{}
 
 	void run()
 	{
-		io_context = std::make_shared<boost::asio::io_context>();
 		boost::fibers::use_scheduling_algorithm<boost::fibers::asio::round_robin>(io_context);
 
+		peer_manager_.start();
 		keep_well_connected_fiber = boost::fibers::fiber([this](){ keep_well_connected(); });
 		keep_up_to_date_fiber     = boost::fibers::fiber([this](){ keep_up_to_date(); });
+		keep_printing_stats_fiber = boost::fibers::fiber([this](){ keep_printing_stats(); });
 		boost::this_fiber::sleep_for(std::chrono::seconds(1));
 		
 		io_context->run();
 				
 		keep_well_connected_fiber.join();
 		keep_up_to_date_fiber.join();
+		keep_printing_stats_fiber.join();
 	}
 
 	void keep_well_connected()
 	{
-		size_t parallel_connection_ratio = conf.lock()->parallel_connection_ratio;
-		size_t min_peer_count            = conf.lock()->min_peer_count;
-
-		std::set<config::peer> untried_peers  = conf.lock()->known_peers;
-		std::set<config::peer> rejected_peers = conf.lock()->rejected_peers;
-
-		std::vector<std::shared_ptr<peer<network>>> trying_peers;
-		trying_peers.reserve(min_peer_count * parallel_connection_ratio);
-
-		for (;;)
+		for (;;boost::this_fiber::sleep_for(std::chrono::seconds(1)))
 		{
-			if (handshaken_peers.empty() && untried_peers.empty() && trying_peers.empty())
-			{
-				error = true;
-				std::cout << "No more known peers, can't connect." << std::endl;
-				return;
+			while (peers.size() < conf->min_peer_count) {
+				auto p_sptr = peer_manager_.get_peer();
+				peers.push_back(p_sptr);
+				std::cout << "got peer keep_well_connected" << std::endl;
 			}
-
-			if (handshaken_peers.size() < min_peer_count)
-			{
-				size_t needed_tries = (min_peer_count - handshaken_peers.size()) * parallel_connection_ratio;
-				while (trying_peers.size() < needed_tries && ! untried_peers.empty())
-				{
-					auto p = std::make_shared<peer<network>>(*this, *untried_peers.begin(), conf);
-					untried_peers.erase(untried_peers.begin());
-					trying_peers.push_back(p);
-					p->start();
-				}
-			}
-			boost::this_fiber::sleep_for(std::chrono::seconds(1));
-			
-			// an inefficient erase_if
-			//for (int i=0 ; i<trying_peers.size() ; )
-			//{
-			//	auto & p = trying_peers[i];
-			//	bool remove = false;
-			//	if ( ! p)
-			//		remove = true;
-			//	if (p->error) {
-			//		//std::cout << "Rejecting " << p->get_config().ip << " " << p->get_config().port << std::endl;
-			//		rejected_peers.insert(p->get_config());
-			//		untried_peers.erase(p->get_config());
-			//		remove = true;
-			//	} else if (p->got_handshake()) {
-			//		handshaken_peers.push_back(p);
-			//		untried_peers.erase(p->get_config());
-			//		remove = true;
-			//	}
-			//	if (remove)
-			//	{
-			//		std::swap(trying_peers[i], trying_peers.back());
-			//		trying_peers.pop_back();
-			//	}
-			//	else
-			//		i++;
-			//}
-			std::erase_if(trying_peers, [&](const auto & p)
-				{
-					if ( ! p)
-						return true;
-					if (p->error) {
-						//std::cout << "Rejecting " << p->get_config().ip << " " << p->get_config().port << std::endl;
-						rejected_peers.insert(p->get_config());
-						untried_peers.erase(p->get_config());
-						return true;
-					} else if (p->got_handshake()) {
-						handshaken_peers.push_back(p);
-						untried_peers.erase(p->get_config());
-						return true;
-					}
-					return false;
-				});
-			//std::cout << "Handshaken with " << handshaken_peers.size() << std::endl;
 		}
 	}
 
-	std::shared_ptr<peer<network>> select_peer()
+	void keep_printing_stats()
 	{
-		// Random for now. How about a round robin here?
-		auto p = *std::next(handshaken_peers.begin(), rand() % handshaken_peers.size());
-		while ( ! p || p->error)
-		{
-			boost::this_fiber::sleep_for(std::chrono::microseconds(1));
-			p = *std::next(handshaken_peers.begin(), rand() % handshaken_peers.size());
-		}
-		return p;
+		for (;;boost::this_fiber::sleep_for(std::chrono::seconds(1)))
+			print_stats();
 	}
+
+	void print_stats()
+	{
+		static size_t bytes_sent_then = 0;
+		static size_t bytes_rcvd_then = 0;
+		static auto then = std::chrono::system_clock::now();
+
+		std::cout << "Handshaken with " << peers.size() << std::endl
+		          << "Bytes sent: " << this->bytes_sent << std::endl
+		          << "Bytes rcvd: " << this->bytes_rcvd << std::endl;
+		std::cout << bc->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
+		bc->print(0);
+		auto now = std::chrono::system_clock::now();
+		auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now-then).count();
+		if (milliseconds != 0) {
+			std::cout << "Sending bytes: " << (this->bytes_sent-bytes_sent_then) / milliseconds << " kB/s. : " << 8*(this->bytes_sent-bytes_sent_then) / milliseconds << " kb/s." << std::endl;
+			std::cout << "Recving bytes: " << (this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kB/s. : " << 8*(this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kb/s." << std::endl;
+		}
+		then = now;
+		bytes_sent_then = this->bytes_sent;
+		bytes_rcvd_then = this->bytes_rcvd;
+	}
+
+	//std::shared_ptr<peer<network>> select_peer()
+	//{
+	//	// Random for now. How about a round robin here?
+	//	auto p = *std::next(peers.begin(), rand() % peers.size());
+	//	while ( ! p || p->error)
+	//	{
+	//		boost::this_fiber::sleep_for(std::chrono::microseconds(1));
+	//		p = *std::next(peers.begin(), rand() % peers.size());
+	//	}
+	//	return p;
+	//}
 
 	void keep_up_to_date()
 	{
-		while (handshaken_peers.empty())
-			boost::this_fiber::sleep_for(std::chrono::milliseconds(1));
-
 		// initial sync
-		//if (bc->best_height() == blockchain::no_height)
-		//	missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
+		if (bc->best_height() == blockchain::no_height)
+			missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
 		synchronize_blockchain();
-	}
-	
-	std::shared_ptr<peer<network>> steal_handshaken_peer()
-	{
-		while (handshaken_peers.empty())
-			boost::this_fiber::sleep_for(std::chrono::milliseconds(100));
-		auto p = handshaken_peers.back();
-		handshaken_peers.pop_back();
-		return p;
 	}
 
 	void synchronize_blockchain()
 	{
+		auto get_last_known_block_hash = [&]() -> Hash256
+			{
+				if ( ! missing_blocks.empty())
+					return missing_blocks.back();
+				else if (bc->best_height() != blockchain::no_height)
+					return bc->get_last_known_block_hash();
+				else
+					return blockchain::testnet_genesis_block_hash;
+			};
+
 		auto get_block_hashes_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch,
 			[&]() {
-				for (int i=0 ; i<100 ; i++)
+				for (int i=0 ; i<10 ; i++)
 				{
-					auto p = steal_handshaken_peer();
-					bool rcvd = true;
-					message inv_msg;
-					while(rcvd)
+					auto p = peer_manager_.get_peer();
+					//std::cout << "Got peer get_block_hashes_fiber" << std::endl;
+
+					for (;;)
 					{
-						if ( ! missing_blocks.empty())
-							std::tie(rcvd,inv_msg) = p->get_next_blocks_inv(missing_blocks.back());
-						else if (bc->best_height() != blockchain::no_height)
-							std::tie(rcvd,inv_msg) = p->get_next_blocks_inv(bc->get_last_known_block_hash());
-						else {
-							missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
-							std::tie(rcvd,inv_msg) = p->get_next_blocks_inv(blockchain::testnet_genesis_block_hash);
+						Hash256 request_hash = get_last_known_block_hash();
+						//std::cout << "Requesting blocks after " << request_hash << std::endl;
+						p->send_getblocks_msg(request_hash);
+
+						for ( auto timeout=std::chrono::system_clock::now()+std::chrono::seconds(5)
+							; std::chrono::system_clock::now() < timeout
+							; boost::this_fiber::sleep_for(std::chrono::milliseconds(10)) )
+						{
+							if (get_last_known_block_hash() != request_hash) {
+								//std::cout << "we got new unknown blocks ============================" << std::endl;
+								break;
+							}
 						}
-						if ( ! rcvd)
-							break; // choose another peer
-						try {
-							size_t missing_blocks_count = missing_blocks.size();
-							process_inv_msg(inv_msg);
-							if (missing_blocks.size() - missing_blocks_count < 500)
-								break; // didn't get 500 new blocks, this peer knows nothing, try another one
-							i = 0; // we got a full page of block hashes, we're far from being done
-						} catch (const std::exception & e) {
-							break;
+						if (get_last_known_block_hash() == request_hash)
+						{
+							//std::cout << "no new blocks let's get anoter peer !!!!!!!!!!!!!!!!!!!!!!!" << std::endl;
+							break; // get another peer
 						}
 					}
+					peer_manager_.return_peer(p);
 				}
+				std::cout << "I'm done getting new block hashes." << std::endl;
 			});
 
 		boost::fibers::fiber get_blocks_fibers[50];
 		for (auto & f : get_blocks_fibers)
 			f = boost::fibers::fiber([&]()
 					{
-						std::cout << "Getblock fiber" << std::endl;
+						//std::cout << "Getblock fiber" << std::endl;
 						std::chrono::seconds timeout(10);
-						for (int i=0 ; i<10 ; i++)
+						for (;;)
 						{
-							auto p = steal_handshaken_peer();
-							std::cout << "Getblock fiber got peer" << std::endl;
+							while(missing_blocks.empty())
+								boost::this_fiber::sleep_for(std::chrono::seconds(1));
+							auto p = peer_manager_.get_peer();
+							std::cout << "Got peer get_blocks_fibers" << std::endl;
 							// if we can't get a block every 60s, we'll nevet get that full blockchain
-							auto deadline = std::chrono::system_clock::now() + timeout;
-							while(std::chrono::system_clock::now() < deadline)
+							for ( auto deadline = std::chrono::system_clock::now() + timeout
+							    ; std::chrono::system_clock::now() < deadline
+								; )
 							{
-								if (missing_blocks.empty())
-								{
-									boost::this_fiber::sleep_for(std::chrono::milliseconds(1));
+								if (missing_blocks.empty()) {
+									boost::this_fiber::sleep_for(std::chrono::seconds(1));
 									continue;
 								}
 								Hash256 h = missing_blocks.front();
-								std::cout << "Getblock fiber get block " << h << std::endl;
+								//std::cout << "Getblock fiber get block " << h << std::endl;
 								missing_blocks.pop_front();
 								bool rcvd = true;
 								message msg;
 								std::tie(rcvd, msg) = p->get_block(h, timeout);
-								if ( ! rcvd)
+								if ( ! rcvd) {
 									missing_blocks.push_front(h);
-								else
-								{
+								} else {
 									deadline = std::chrono::system_clock::now() + timeout;
 									if ( ! process_block_msg(msg, h))
 										missing_blocks.push_front(h);
 								}
 							}
-
+							peer_manager_.return_peer(p);
 						}
 					}
 				);
@@ -930,8 +1099,6 @@ struct network
 			{
 				case MSG_BLOCK:
 					if (bc->has(h))
-						continue;
-					if (std::find(missing_blocks.begin(), missing_blocks.end(), h) != missing_blocks.end())
 						continue;
 					missing_blocks.push_back(h);
 					break;
@@ -1000,7 +1167,7 @@ struct network
 				//pxln(tx_sv);
 				txids.emplace_back();
 				fill_dbl_sha256(txids.back(), tx_sv);
-				std::cout << std::hex << txids.back() << std::dec << std::endl;
+				//std::cout << std::hex << txids.back() << std::dec << std::endl;
 			}
 
 			Hash256 merkle_root;
@@ -1021,12 +1188,9 @@ struct network
 			return false;
 		}
 
-		std::cout << "Got block: " << std::hex << bl.prev_block_hash << " <- " << hash << std::dec << std::endl;
-		std::cout << bc->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
+		//std::cout << "Got block: " << std::hex << bl.prev_block_hash << " <- " << hash << std::dec << std::endl;
 
 		bc->add(std::move(bl), hash);
-
-		bc->print(0);
 
 		return true;
 	}

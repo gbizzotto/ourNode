@@ -188,38 +188,24 @@ struct blockchain
 			;
 	}
 
-	void check_root_vs_orphans()
+	void check_vs_orphans(block_hash_map & bhm)
 	{
-		for (int i=0 ; i<orphan_chains.size() ; i++)
+		auto it = orphan_chains.begin();
+		while (it != orphan_chains.end())
 		{
-			auto & orphan = orphan_chains[i];
-			if (orphan->root_chain.by_height_nocheck(0).prev_block_hash == root_chain.get_last_known_block_hash())
+			auto & orphan = *it;
+			if (orphan->root_chain.by_height_nocheck(0).prev_block_hash == bhm.get_last_known_block_hash())
 			{
 				if ( ! orphan->orphan_chains.empty())
 					std::cout << "orphan shouldn't have orphans" << std::endl;
-				root_chain.merge_nocheck(std::move(orphan->root_chain));
+				bhm.merge_nocheck(std::move(orphan->root_chain));
 				for (auto & branch : orphan->branches)
 					branches.push_back(std::move(branch));
-				orphan_chains.erase(std::next(orphan_chains.begin(), i));
-				return check_root_vs_orphans();
+				orphan_chains.erase(it);
+				it = orphan_chains.begin();
+				continue;
 			}
-		}
-	}
-	void check_orphan_vs_orphans(std::unique_ptr<blockchain> & new_orphan)
-	{
-		for (int i=0 ; i<orphan_chains.size() ; i++)
-		{
-			auto & orphan = orphan_chains[i];
-			if (orphan->root_chain.by_height_nocheck(0).prev_block_hash == new_orphan->get_last_known_block_hash())
-			{
-				if ( ! orphan->orphan_chains.empty())
-					std::cout << "orphan shouldn't have orphans" << std::endl;
-				new_orphan->root_chain.merge_nocheck(std::move(orphan->root_chain));
-				for (auto & branch : orphan->branches)
-					new_orphan->branches.push_back(std::move(branch));
-				orphan_chains.erase(std::next(orphan_chains.begin(), i));
-				return check_orphan_vs_orphans(new_orphan);
-			}
+			++it;
 		}
 	}
 
@@ -227,41 +213,41 @@ struct blockchain
 	{
 		Hash256 & prev_block_hash = bl.prev_block_hash;
 
-		std::cout << "root_chain.size(): " << root_chain.size() << std::endl;
+		//std::cout << "root_chain.size(): " << root_chain.size() << std::endl;
 		if (root_chain.size() == 0)
 		{
 			if (hash == testnet_genesis_block_hash || is_orphan)
 			{
 				root_chain.add_nocheck(std::move(bl), hash);
-				check_root_vs_orphans();
+				check_vs_orphans(root_chain);
 				return;
 			}
 		}
 		// check root chain tip
 		if (root_chain.get_last_known_block_hash() == prev_block_hash) {
-			std::cout << "Added to root chain" << std::endl;
+			//std::cout << "Added to root chain" << std::endl;
 			root_chain.add_nocheck(std::move(bl), hash);
-			check_root_vs_orphans();
+			check_vs_orphans(root_chain);
 			return;
 		}
 		// check branches tips
 		for (auto & branch : branches)
 			if (branch->get_last_known_block_hash() == prev_block_hash) {
-				std::cout << "Added to an extra tip" << std::endl;
+				//std::cout << "Added to an extra tip" << std::endl;
 				branch->add(std::move(bl), hash);
 				return;
 			}
 		// orphan chains tips
 		for (auto & orphan_chain : orphan_chains)
 			if (orphan_chain->get_last_known_block_hash() == prev_block_hash) {
-				std::cout << "Added to orphan block chain" << std::endl;
+				//std::cout << "Added to orphan block chain" << std::endl;
 				orphan_chain->add(std::move(bl), hash);
 				return;
 			}
 
 		// root chain new branch?
 		if (root_chain.height(prev_block_hash) != no_height) {
-			std::cout << "Added as new extra tip line" << std::endl;
+			//std::cout << "Added as new extra tip line" << std::endl;
 			branches.push_back(std::make_unique<blockchain>());
 			branches.back()->add(std::move(bl), hash);;
 			return;
@@ -269,22 +255,22 @@ struct blockchain
 		// branch branch?
 		for (auto & branch : branches)
 			if (branch->has(prev_block_hash)) {
-				std::cout << "Added as new extra branch" << std::endl;
+				//std::cout << "Added as new extra branch" << std::endl;
 				branch->add(std::move(bl), hash);
 				return;
 			}
 		// orphan chain new branch?
 		for (auto & orphan : orphan_chains)
 			if (orphan->has(prev_block_hash)) {
-				std::cout << "Added as new extra branch" << std::endl;
+				//std::cout << "Added as new extra branch" << std::endl;
 				orphan->add(std::move(bl), hash);
 				return;
 			}
 		
-		std::cout << "Added as new orphan block line as orphan" << std::endl;
+		//std::cout << "Added as new orphan block line as orphan" << std::endl;
 		auto new_orphan = std::make_unique<blockchain>();
 		new_orphan->add(std::move(bl), hash, true);
-		check_orphan_vs_orphans(new_orphan);
+		check_vs_orphans(new_orphan->root_chain);
 		orphan_chains.emplace_back(std::move(new_orphan));
 	}
 	size_t size() const
