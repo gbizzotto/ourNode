@@ -692,9 +692,15 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		peer_services    = consume_little_endian<decltype(peer_services)>(sv);
 		peer_timestamp   = consume_little_endian<decltype(peer_timestamp)>(sv);
 		our_net_address  = consume_net_addr(sv, false);
-		peer_net_address = consume_net_addr(sv, false);
-		peer_nonce       = consume_little_endian<decltype(peer_nonce)>(sv);
-		peer_user_agent  = consume_var_str(sv);
+		if (peer_version >= 106)
+		{
+			peer_net_address = consume_net_addr(sv, false);
+			peer_nonce       = consume_little_endian<decltype(peer_nonce)>(sv);
+			peer_user_agent  = consume_var_str(sv);
+			peer_block_height= consume_little_endian<decltype(peer_block_height)>(sv);
+			if (peer_block_height > net.peer_block_height)
+				net.peer_block_height = peer_block_height;
+		}
 
 		send(message("verack"));
 	}
@@ -901,6 +907,7 @@ struct network
 	peer_manager<network> peer_manager_;
 	std::vector<std::shared_ptr<peer<network>>> peers;
 
+	int32_t peer_block_height = 0;
 	std::deque<Hash256> missing_blocks;
 
 	// network stats
@@ -992,7 +999,9 @@ struct network
 		// initial sync
 		if (bc->best_height() == blockchain::no_height)
 			missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
-		synchronize_blockchain();
+		do {
+			synchronize_blockchain();
+		} while (bc->best_height() < peer_block_height);
 	}
 
 	void synchronize_blockchain()
@@ -1006,6 +1015,8 @@ struct network
 				else
 					return blockchain::testnet_genesis_block_hash;
 			};
+
+		bool downloading_block_list = true;
 
 		auto get_block_hashes_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch,
 			[&]() {
@@ -1026,6 +1037,7 @@ struct network
 						{
 							if (get_last_known_block_hash() != request_hash) {
 								//std::cout << "we got new unknown blocks ============================" << std::endl;
+								i = 0;
 								break;
 							}
 						}
@@ -1038,47 +1050,56 @@ struct network
 					peer_manager_.return_peer(p);
 				}
 				std::cout << "I'm done getting new block hashes." << std::endl;
+				downloading_block_list = false;
 			});
 
-		boost::fibers::fiber get_blocks_fibers[50];
-		for (auto & f : get_blocks_fibers)
-			f = boost::fibers::fiber([&]()
-					{
-						//std::cout << "Getblock fiber" << std::endl;
-						std::chrono::seconds timeout(10);
-						for (;;)
+		const int max_DL_fibers_count = 50;
+		std::vector<boost::fibers::fiber> get_blocks_fibers;
+		while(downloading_block_list && get_blocks_fibers.size() < max_DL_fibers_count)
+		{
+			int missing_blocks = peer_block_height - bc->best_height();
+			while (get_blocks_fibers.size() < std::min(max_DL_fibers_count, missing_blocks))
+				get_blocks_fibers.emplace_back([&]()
 						{
-							while(missing_blocks.empty())
-								boost::this_fiber::sleep_for(std::chrono::seconds(1));
-							auto p = peer_manager_.get_peer();
-							std::cout << "Got peer get_blocks_fibers" << std::endl;
-							// if we can't get a block every 60s, we'll nevet get that full blockchain
-							for ( auto deadline = std::chrono::system_clock::now() + timeout
-							    ; std::chrono::system_clock::now() < deadline
-								; )
+							//std::cout << "Getblock fiber" << std::endl;
+							std::chrono::seconds timeout(10);
+							while (downloading_block_list || ! this->missing_blocks.empty())
 							{
-								if (missing_blocks.empty()) {
+								while(this->missing_blocks.empty()) {
 									boost::this_fiber::sleep_for(std::chrono::seconds(1));
 									continue;
 								}
-								Hash256 h = missing_blocks.front();
-								//std::cout << "Getblock fiber get block " << h << std::endl;
-								missing_blocks.pop_front();
-								bool rcvd = true;
-								message msg;
-								std::tie(rcvd, msg) = p->get_block(h, timeout);
-								if ( ! rcvd) {
-									missing_blocks.push_front(h);
-								} else {
-									deadline = std::chrono::system_clock::now() + timeout;
-									if ( ! process_block_msg(msg, h))
-										missing_blocks.push_front(h);
+								auto p = peer_manager_.get_peer();
+								std::cout << "Got peer get_blocks_fibers" << std::endl;
+								// if we can't get a block every 60s, we'll nevet get that full blockchain
+								for ( auto deadline = std::chrono::system_clock::now() + timeout
+									; std::chrono::system_clock::now() < deadline
+									; )
+								{
+									if (this->missing_blocks.empty()) {
+										boost::this_fiber::sleep_for(std::chrono::seconds(1));
+										continue;
+									}
+									Hash256 h = this->missing_blocks.front();
+									//std::cout << "Getblock fiber get block " << h << std::endl;
+									this->missing_blocks.pop_front();
+									bool rcvd = true;
+									message msg;
+									std::tie(rcvd, msg) = p->get_block(h, timeout);
+									if ( ! rcvd) {
+										this->missing_blocks.push_front(h);
+									} else {
+										deadline = std::chrono::system_clock::now() + timeout;
+										if ( ! process_block_msg(msg, h))
+											this->missing_blocks.push_front(h);
+									}
 								}
+								peer_manager_.return_peer(p);
 							}
-							peer_manager_.return_peer(p);
 						}
-					}
-				);
+					);
+			boost::this_fiber::sleep_for(std::chrono::seconds(1));
+		}
 
 		get_block_hashes_fiber.join();
 		for (auto & f : get_blocks_fibers)
