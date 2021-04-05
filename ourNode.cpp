@@ -21,7 +21,7 @@ int main()
 	conf->load("ournode.conf");
 	
 	utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> bc;
-	// bc.load("./"); // select different folders for testnet3/mainnet
+	bc->load("./testnet"); // select different folders for testnet3/mainnet
 
 	ournode::network net(conf, bc);
 	std::thread network_thread([&]() { net.run(); });

@@ -22,24 +22,7 @@ typedef boost::error_info<struct tag_stacktrace, boost::stacktrace::stacktrace> 
 #include "config.hpp"
 #include "sha256sum.hpp"
 #include "blockchain.hpp"
-
-template<typename C>
-bool in(const typename C::value_type & t, const C & c)
-{
-	return std::find(std::begin(c), std::end(c), t) != std::end(c);
-}
-template<typename C>
-bool in(const typename C::key_type & t, const C & c)
-{
-	return c.find(t) != std::end(c);
-}
-template<typename C>
-const typename C::value_type & random(const C & c)
-{
-	if (c.size() == 1)
-		return *c.begin();
-	return *std::next(c.begin(), rand()%(c.size()-1));
-}
+#include "misc.hpp"
 
 namespace ournode {
 
@@ -48,76 +31,12 @@ namespace ournode {
 // node services
 #define NODE_NETWORK 1
 
-template<typename T>
-T consume_little_endian(std::string_view & data)
-{
-	if (data.size() < sizeof(T))
-		throw std::invalid_argument("not enough data");
-	T result = 0;
-	for (int i=0 ; i < sizeof(T) ; i++)
-		result += (((T)data[i]) & 0xFF) << (i*8);
-	data.remove_prefix(sizeof(T));
-	return result;
-}
-template<typename T>
-T consume_big_endian(std::string_view & data)
-{
-	if (data.size() < sizeof(T))
-		throw std::invalid_argument("not enough data");
-	T result = 0;
-	for (int i=0 ; i < sizeof(T) ; i++) {
-		result <<= 8;
-		result += (((T)data[i]) & 0xFF);
-	}
-	data.remove_prefix(sizeof(T));
-	return result;
-}
-template<typename T>
-void serialize_little_endian(unsigned char * data, T value)
-{
-	for (int i=0 ; i<sizeof(T) ; i++, value >>= 8)
-		*data++ = (value & 0xFF);
-}
-template<typename T>
-void serialize_big_endian(unsigned char * data, T value)
-{
-	for (int i=sizeof(T)-1 ; i>0 ; i--)
-		*data++ = ((value >> (8*i)) & 0xFF);
-}
-std::uint64_t consume_var_int(std::string_view & data)
-{
-	if (data.size() < 1)
-		throw std::invalid_argument("data.size() < 1");
-	unsigned char first = data[0];
-	data.remove_prefix(1);
-	if (first == 0xFF) {
-		auto result = consume_little_endian<std::uint64_t>(data);
-		return result;
-	} else if (first == 0xFE) {
-		auto result = consume_little_endian<std::uint32_t>(data);
-		return result;
-	} else if (first == 0xFD) {
-		auto result = consume_little_endian<std::uint16_t>(data);
-		return result;
-	} else {
-		return first;
-	}
-}
-void consume_bytes(std::string_view & src, char *dst, size_t len)
-{
-	if (src.size() < len)
-		throw std::invalid_argument("data.size() < 1");
-	std::copy(src.data(), src.data()+len, dst);
-	src.remove_prefix(len);
-}
 
 std::uint32_t calculate_checksum(unsigned char * data, size_t len)
 {
 	Hash256 hash;
 	fill_dbl_sha256(hash, std::string_view((char*)data, len));
 	return hash.hash_hash;
-	//std::string_view sv((char*)hash.h, 4);
-	//return consume_little_endian<std::uint32_t>(sv);
 }
 
 bool recv_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::mutable_buffer buffer, std::chrono::seconds timeout)
@@ -150,13 +69,6 @@ bool send_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::const_buffer
 	return future.get();
 }
 
-std::string consume_var_str(std::string_view & sv)
-{
-	size_t size = consume_var_int(sv);
-	std::string result(size, 0);
-	consume_bytes(sv, result.data(), size);
-	return result;
-}
 
 struct net_addr
 {
@@ -467,7 +379,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 
 	void run()
 	{
-		std::cout << "Trying " << my_peer_config << std::endl;
+		//std::cout << "Trying " << my_peer_config << std::endl;
 		if ( !connect()) {
 			return;
 		}
@@ -480,7 +392,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 				self->send_version_msg();
 				bool rcvd = self->expect_many({"version","verack"}, std::chrono::seconds(20));
 				if ( ! rcvd) {
-					std::cout << "Coudln't connect to " << self->my_peer_config << std::endl;
+					//std::cout << "Coudln't connect to " << self->my_peer_config << std::endl;
 					return;
 				}
 				//std::cout << "Hands shaken with " << self->my_peer_config << std::endl;
@@ -491,7 +403,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 					//std::cout << "Didn't receive 'addr' msg from " << self->my_peer_config << std::endl;
 					return;
 				}*/
-				std::cout << "Fully connected to " << self->my_peer_config << std::endl;
+				//std::cout << "Fully connected to " << self->my_peer_config << std::endl;
 				self->quality = peer_config::Quality::Good;
 				self->status = Handshaken;
 			}).detach();
@@ -903,8 +815,6 @@ struct peer_manager
 
 	void check_need_more_tries(size_t up=0)
 	{
-		load_from_conf();
-
 		size_t parallel_connections_max;
 		size_t parallel_connections_ratio;
 		{
@@ -914,18 +824,20 @@ struct peer_manager
 			parallel_connections_ratio = proxy->parallel_connections_ratio;
 			//std::cout << "unlock 2" << std::endl;
 		}
-		std::cout << "check_need_more_tries "
-		          << "handshaken_peers.waiting_count(): " << handshaken_peers.waiting_count()
-		          << std::endl
-		          << "up: " << up
-		          << std::endl
-		          << std::min(parallel_connections_max, parallel_connections_ratio*(up+handshaken_peers.waiting_count()))
-		          << std::endl;
+		//std::cout << "check_need_more_tries "
+		//          << "handshaken_peers.waiting_count(): " << handshaken_peers.waiting_count()
+		//          << std::endl
+		//          << "up: " << up
+		//          << std::endl
+		//          << std::min(parallel_connections_max, parallel_connections_ratio*(up+handshaken_peers.waiting_count()))
+		//          << std::endl;
 		//std::cout << "closed_peers.size(): " << closed_good_peers.size() + closed_unknown_peers.size() << std::endl;
 		for ( size_t parallel_connections_needed = std::min(parallel_connections_max, parallel_connections_ratio*(up+handshaken_peers.waiting_count()))
 		    ; parallel_connections_needed > opening_peers.size()
 			; parallel_connections_needed-- )
 		{
+			if (closed_good_peers.empty() && closed_unknown_peers.empty())
+				load_from_conf();
 			if ( ! closed_good_peers.empty())
 			{
 				auto p = random(closed_good_peers).second;
@@ -1185,49 +1097,54 @@ struct network
 
 		const int max_DL_fibers_count = 50;
 		std::vector<boost::fibers::fiber> get_blocks_fibers;
+		get_blocks_fibers.reserve(max_DL_fibers_count);
 		while(downloading_block_list && get_blocks_fibers.size() < max_DL_fibers_count && go_on)
 		{
 			int missing_blocks = peer_block_height - bc->best_height();
+			if (missing_blocks < 0) {
+				boost::this_fiber::sleep_for(std::chrono::seconds(1));
+				continue;
+			}
 			while (get_blocks_fibers.size() < std::min(max_DL_fibers_count, missing_blocks) && go_on)
 				get_blocks_fibers.emplace_back([&]()
+					{
+						std::chrono::seconds timeout(10);
+						while (go_on && (downloading_block_list || ! this->missing_blocks.empty()))
 						{
-							std::chrono::seconds timeout(10);
-							while (go_on && (downloading_block_list || ! this->missing_blocks.empty()))
+							while(this->missing_blocks.empty()) {
+								boost::this_fiber::sleep_for(std::chrono::seconds(1));
+								continue;
+							}
+							auto p = my_peer_manager.get_peer();
+							if ( ! p)
+								return;
+							//std::cout << "Got peer for get_blocks_fibers" << std::endl;
+							// if we can't get a block every 60s, we'll nevet get that full blockchain
+							for ( auto deadline = std::chrono::system_clock::now() + timeout
+								; std::chrono::system_clock::now() < deadline && go_on
+								; )
 							{
-								while(this->missing_blocks.empty()) {
+								if (this->missing_blocks.empty()) {
 									boost::this_fiber::sleep_for(std::chrono::seconds(1));
 									continue;
 								}
-								auto p = my_peer_manager.get_peer();
-								if ( ! p)
-									return;
-								// if we can't get a block every 60s, we'll nevet get that full blockchain
-								for ( auto deadline = std::chrono::system_clock::now() + timeout
-									; std::chrono::system_clock::now() < deadline && go_on
-									; )
-								{
-									if (this->missing_blocks.empty()) {
-										boost::this_fiber::sleep_for(std::chrono::seconds(1));
-										continue;
-									}
-									Hash256 h = this->missing_blocks.front();
-									//std::cout << "Getblock fiber get block " << h << std::endl;
-									this->missing_blocks.pop_front();
-									bool rcvd = true;
-									message msg;
-									std::tie(rcvd, msg) = p->get_block(h, timeout);
-									if ( ! rcvd) {
+								Hash256 h = this->missing_blocks.front();
+								//std::cout << "Getblock fiber get block " << h << std::endl;
+								this->missing_blocks.pop_front();
+								bool rcvd = true;
+								message msg;
+								std::tie(rcvd, msg) = p->get_block(h, timeout);
+								if ( ! rcvd) {
+									this->missing_blocks.push_front(h);
+								} else {
+									deadline = std::chrono::system_clock::now() + timeout;
+									if ( ! process_block_msg(msg, h))
 										this->missing_blocks.push_front(h);
-									} else {
-										deadline = std::chrono::system_clock::now() + timeout;
-										if ( ! process_block_msg(msg, h))
-											this->missing_blocks.push_front(h);
-									}
 								}
-								my_peer_manager.return_peer(p);
 							}
+							my_peer_manager.return_peer(p);
 						}
-					);
+					});
 			boost::this_fiber::sleep_for(std::chrono::seconds(1));
 		}
 
@@ -1301,8 +1218,8 @@ struct network
 			std::tie(bl, hash) = consume_header(data, false);
 
 			if (hash != supposed_block_hash) {
-				std::cout << "Was expecting " << supposed_block_hash
-						<< ", got " << hash << std::endl;
+				//std::cout << "Was expecting " << supposed_block_hash
+				//		<< ", got " << hash << std::endl;
 				return false;
 			}
 
@@ -1341,7 +1258,7 @@ struct network
 
 		//std::cout << "Got block: " << std::hex << bl.prev_block_hash << " <- " << hash << std::dec << std::endl;
 
-		bc->add(std::move(bl), hash);
+		bc->add(std::string_view(msg.body.data(), msg.body.size()), hash, bl.prev_block_hash);
 
 		return true;
 	}
