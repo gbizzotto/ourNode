@@ -3,13 +3,14 @@
 
 #include <mutex>
 #include <condition_variable>
+#include "on_scope_exit.hpp"
 
 namespace utttil {
 
 template<typename T, class Mutex>
 class synchronized_proxy
 {
-	template<typename X, class Y>
+	template<typename X, class Y, class Z>
 	friend class synchronized;
 
 private:
@@ -49,7 +50,7 @@ private:
 };
 
 
-template<typename T, class Mutex=std::mutex>
+template<typename T, class Mutex=std::mutex, class CV=std::condition_variable>
 class synchronized
 {
 public:
@@ -58,32 +59,23 @@ public:
 	using proxy_type = synchronized_proxy<T,Mutex>;
 	
 	synchronized() = default;
-	synchronized(const T & t)
-		: t(t)
-	{}
-	synchronized(T && t)
-		:t(std::move(t))
-	{}
+	synchronized(const T  & t) : t(          t ) {}
+	synchronized(      T && t) : t(std::move(t)) {}
+	synchronized(const proxy_type  & sp) : t(          *sp.t ) {}
+	synchronized(      proxy_type && sp) : t(std::move(*sp.t)) {}
+
 	template<typename... Args>
 	synchronized(Args... args)
 		:t(args...)
-	{} 
-	
-	synchronized(const proxy_type & sp)
-		:t(*sp.t)
-	{}
-	synchronized(proxy_type && sp)
-		:t(std::move(*sp.t))
 	{}
 
-	proxy_type lock() {
-		return proxy_type(mutex, t);
-	}
-	proxy_type try_lock() {
-		return proxy_type(mutex, t, 0);
-	}
+	proxy_type     lock() { return proxy_type(mutex, t   ); }
+	proxy_type try_lock() { return proxy_type(mutex, t, 0); }
 
 	proxy_type operator->() {
+		return proxy_type(mutex, t);
+	}
+	proxy_type operator*() {
 		return proxy_type(mutex, t);
 	}
 
@@ -93,23 +85,22 @@ public:
 		auto s = proxy_type(mutex, t);
 		if (check(t))
 			return s;
+		cv_counter++;
+		ON_SCOPE_EXIT([&](){ cv_counter--; });
 		cv.wait(s.lock, [&](){ return check(t); });
 		return s;
 	}
 
-	void notify_one()
-	{
-		cv.notify_one();
-	}
-	void notify_all()
-	{
-		cv.notify_all();
-	}
+	void notify_one() { cv.notify_one(); }
+	void notify_all() { cv.notify_all(); }
+
+	size_t waiting_count() const { return cv_counter; }
 
 protected:
 	T t;
 	Mutex mutex;
-	std::condition_variable cv;
+	CV cv;
+	size_t cv_counter = 0;
 };
 
 } // namespace

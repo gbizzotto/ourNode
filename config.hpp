@@ -1,38 +1,68 @@
 
 #pragma once
 
-#include <set>
+#include <map>
 #include <string>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <iostream>
 
 namespace ournode {
 
-struct config
+struct peer_config
 {
-	struct peer
+	enum Quality
 	{
-		std::string ip = "";
-		int port = 0;
-		std::string version = "";
-		operator bool()
-		{
-			return ip.empty() || port==0;
-		}
+		Good = 0,
+		Unknown = 1,
+		Unresponsive = 2,
+		Rejected = 3,
 	};
 
-	std::set<peer> trusted_peers;
-	std::set<peer> known_peers;
-	std::set<peer> rejected_peers;
-	int parallel_connection_ratio = 10;
-	int min_peer_count = 10;
-	std::string filename;
+	std::string ip = "";
+	int port = 0;
 
-	config()
-	{
-		insert_peer("127.0.0.1", 18333);
-	}
+	operator bool() const  { return ip.empty() || port==0; }
+};
+
+bool operator<(const peer_config & left, const peer_config & right)
+{
+	return left.ip < right.ip || (left.ip == right.ip && left.port < right.port);
+}
+bool operator==(const peer_config & left, const peer_config & right)
+{
+	return left.ip == right.ip && left.port == right.port;
+}
+
+template<typename O>
+O & operator<<(O & out, const peer_config & p)
+{
+	return out << p.ip << " " << p.port;
+}
+
+template<typename O>
+O & operator<<(O & out, const peer_config::Quality & q)
+{
+	return out << [](const peer_config::Quality & q)
+		{
+			switch (q)
+			{
+				case peer_config::Quality::Good        : return "good";
+				case peer_config::Quality::Unknown     : return "unknown";
+				case peer_config::Quality::Unresponsive: return "unresponsive";
+				case peer_config::Quality::Rejected    : return "rejected";
+			}
+		}(q);
+}
+
+struct config
+{
+	std::map<peer_config,peer_config::Quality> peers;
+	size_t parallel_connections_max = 100;
+	size_t parallel_connections_ratio = 10;
+	size_t min_peer_count = 10;
+	std::string filename;
 
 	void load(std::string filename_)
 	{
@@ -40,43 +70,50 @@ struct config
 
 		std::ifstream infile(filename);
 		if (infile)
-			known_peers.clear();
-		std::string line;
-		while (std::getline(infile, line))
 		{
-			std::istringstream iss(line);
-			std::string type;
-			iss >> type;
-			if (type == "trusted_peer")
+			std::string line;
+			while (std::getline(infile, line))
 			{
-				std::string ip;
-				int port;
-				iss >> ip >> port;
-				trusted_peers.insert({ip, port, ""});
-			}
-			else if (type == "known_peer")
-			{
-				std::string ip;
-				int port;
-				iss >> ip >> port;
-				known_peers.insert({ip, port, ""});
-			}
-			else if (type == "rejected_peer")
-			{
-				std::string ip;
-				int port;
-				iss >> ip >> port;
-				rejected_peers.insert({ip, port, ""});
-			}
-			else if (type == "parallel_connection_ratio")
-			{
-				iss >> parallel_connection_ratio;
-			}
-			else if (type == "min_peer_count")
-			{
-				iss >> min_peer_count;
+				std::istringstream iss(line);
+				std::string type;
+				iss >> type;
+				if (type == "peer")
+				{
+					std::string quality;
+					std::string ip;
+					int port;
+					iss >> quality >> ip >> port;
+
+					peer_config::Quality q = [&quality]()
+						{
+							if (quality == "good")
+								return peer_config::Quality::Good;
+							else if (quality == "unresponsive")
+								return peer_config::Quality::Unresponsive;
+							else if (quality == "rejected")
+								return peer_config::Quality::Rejected;
+							else
+								return peer_config::Quality::Unknown;
+							
+						}();
+					peers[{ip, port}] = q;
+				}
+				else if (type == "parallel_connections_max")
+				{
+					iss >> parallel_connections_max;
+				}
+				else if (type == "parallel_connections_ratio")
+				{
+					iss >> parallel_connections_ratio;
+				}
+				else if (type == "min_peer_count")
+				{
+					iss >> min_peer_count;
+				}
 			}
 		}
+		if (peers.empty())
+			peers[{"127.0.0.1",18333}] = peer_config::Quality::Unknown;
 	}
 
 	void save()
@@ -84,51 +121,34 @@ struct config
 		if (filename.empty())
 			return;
 		std::ofstream outfile(filename);
-		outfile << "min_peer_count "            << min_peer_count            << std::endl;
-		outfile << "parallel_connection_ratio " << parallel_connection_ratio << std::endl;
-		for (const peer & p : trusted_peers)
-			outfile << "trusted_peer " << p.ip << " " << p.port << std::endl;
-		for (const peer & p : known_peers)
-			outfile << "known_peer " << p.ip << " " << p.port << std::endl;
-		for (const peer & p : rejected_peers)
-			outfile << "rejected_peer " << p.ip << " " << p.port << std::endl;
+		outfile << "min_peer_count "             << min_peer_count             << std::endl;
+		outfile << "parallel_connections_max "   << parallel_connections_max   << std::endl;
+		outfile << "parallel_connections_ratio " << parallel_connections_ratio << std::endl;
+		for (const auto & p : peers)
+			outfile << "peer " << p.second << " " << p.first << std::endl;
 	}
 
 	void insert_peer(const std::string & ip, int port)
 	{
-		auto ip_match = [ip](const peer & p){ return p.ip==ip; };
-		auto is_trusted    = std::find_if(   trusted_peers.begin(),    trusted_peers.end(), ip_match) !=    trusted_peers.end();
-		auto is_rejected   = std::find_if(  rejected_peers.begin(),   rejected_peers.end(), ip_match) !=   rejected_peers.end();
-		if (!is_trusted && !is_rejected)
-			known_peers.insert({ip, port, ""});
+		peer_config pc{ip,port};
+		auto it = peers.find(pc);
+		if (it == peers.end())
+			peers.insert(std::make_pair(pc, peer_config::Quality::Unknown));
+	}
+	void erase_peer(const peer_config & p)
+	{
+		peers.erase(p);
 	}
 
-	void erase_peer(const peer & p)
+	void set_peer_quality(const peer_config & p, const peer_config::Quality & q)
 	{
-		trusted_peers .erase(p);
-		known_peers   .erase(p);
-		rejected_peers.erase(p);
+		peers[p] = q;
 	}
-	void trust_peer(const peer & p)
+
+	peer_config::Quality get_quality(const peer_config & p)
 	{
-		known_peers.erase(p);
-		trusted_peers.insert(p);
-	}
-	void reject_peer(const peer & p)
-	{
-		known_peers.erase(p);
-		rejected_peers.insert(p);
+		return peers.insert(std::make_pair(p,peer_config::Unknown)).first->second;
 	}
 };
-
-bool operator<(const config::peer & left, const config::peer & right)
-{
-	return left.ip < right.ip || left.port < right.port;
-}
-bool operator==(const config::peer & left, const config::peer & right)
-{
-	return left.ip == right.ip && left.port == right.port;
-}
-
 
 } // namespace
