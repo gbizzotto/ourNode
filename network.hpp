@@ -610,8 +610,8 @@ struct peer : std::enable_shared_from_this<peer<network>>
 			process_reject_msg(m);
 		else if (m.command == "verack")
 		{} // not much to do here
-		else if (m.command == "block") {
-		}
+		else if (m.command == "block")
+		{}
 		else if (m.command == "inv") {
 			net.process_inv_msg(m);
 		}
@@ -1122,85 +1122,53 @@ struct network
 				downloading_block_list = false;
 			});
 
-		const int max_DL_fibers_count = 30;
+		const int max_DL_fibers_count = 10;
 		std::vector<boost::fibers::fiber> get_blocks_fibers;
 		get_blocks_fibers.reserve(max_DL_fibers_count);
-		while((downloading_block_list || ! this->missing_blocks.empty()) && go_on)
-		{
-			int missing_blocks = peer_block_height - bc->best_height();
-			if (missing_blocks < 0) {
-				boost::this_fiber::sleep_for(std::chrono::seconds(1));
-				continue;
-			}
-			while (get_blocks_fibers.size() < std::min(max_DL_fibers_count, missing_blocks) && go_on)
-				get_blocks_fibers.emplace_back([&]()
+		while (get_blocks_fibers.size() < max_DL_fibers_count)
+			get_blocks_fibers.emplace_back([&]()
+			{
+				std::chrono::seconds timeout(20);
+				std::list<Hash256> asked_blocks;
+				auto p = my_peer_manager.get_peer();
+				if ( ! p)
+					return;
+
+				while((downloading_block_list || ! this->missing_blocks.empty()) && go_on)
+				{
+					if (this->missing_blocks.empty()) {
+						boost::this_fiber::sleep_for(std::chrono::seconds(1));
+						continue;
+					}
+
+					int blocks_to_get = std::min(1 + (int)this->missing_blocks.size() / max_DL_fibers_count, 100);
+					std::list<Hash256> tmp_list;
+					tmp_list.splice(tmp_list.begin(), this->missing_blocks, this->missing_blocks.begin(), std::next(this->missing_blocks.begin(), blocks_to_get));
+					p->send_block_getdata_msg(tmp_list);
+					asked_blocks.splice(asked_blocks.end(), tmp_list);
+					
+					while( ! asked_blocks.empty())
 					{
-						std::chrono::seconds timeout(20);
-						while((downloading_block_list || ! this->missing_blocks.empty()) && go_on)
+						bool rcvd = true;
+						message msg;
+						std::tie(rcvd, msg) = p->expect("block", timeout);
+						if ( ! rcvd)
 						{
-							if(this->missing_blocks.empty()) {
-								boost::this_fiber::sleep_for(std::chrono::seconds(1));
-								continue;
-							}
-							auto p = my_peer_manager.get_peer();
+							std::cout << " ! rcvd" << std::endl;
+							this->missing_blocks.splice(this->missing_blocks.begin(), asked_blocks);
+							my_peer_manager.return_peer(p);
+							p = my_peer_manager.get_peer();
 							if ( ! p)
 								return;
-							//std::cout << "Got peer for get_blocks_fibers" << std::endl;
-							// if we can't get a block every 60s, we'll nevet get that full blockchain
-
-							std::list<Hash256> asked_blocks;
-
-							for ( auto deadline = std::chrono::system_clock::now() + timeout
-								; std::chrono::system_clock::now() < deadline && go_on
-								; )
-							{
-								if (this->missing_blocks.empty() && asked_blocks.empty()) {
-									boost::this_fiber::sleep_for(std::chrono::seconds(1));
-									continue;
-								}
-
-								int blocks_to_get = std::min(1 + (int)this->missing_blocks.size() / max_DL_fibers_count, 100);
-								std::list<Hash256> tmp_list;
-								tmp_list.splice(tmp_list.begin(), this->missing_blocks, this->missing_blocks.begin(), std::next(this->missing_blocks.begin(), blocks_to_get));
-								p->send_block_getdata_msg(tmp_list);
-								asked_blocks.splice(asked_blocks.end(), tmp_list);
-								
-								while( ! asked_blocks.empty())
-								{
-									bool rcvd = true;
-									message msg;
-									//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " Get block " << std::endl;
-									std::tie(rcvd, msg) = p->expect("block", timeout);
-									//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " RCVD block " << std::endl;
-
-									if ( ! rcvd)
-									{
-										std::cout << " ! rcvd" << std::endl;
-										this->missing_blocks.splice(this->missing_blocks.begin(), asked_blocks);
-										break;
-									}
-									else
-									{
-										Hash256 h = process_block_msg_2(msg);
-										std::erase_if(asked_blocks, [&](const Hash256 & elm)
-											{
-												if (h == elm)
-												{
-													//log << utttil::LogLevel::INFO << "got block " << h << std::endl;
-													return true;
-												}
-												return false;
-											});
-										deadline = std::chrono::system_clock::now() + timeout;										
-									}
-								}
-							}
-							my_peer_manager.return_peer(p);
 						}
-					});
-			boost::this_fiber::sleep_for(std::chrono::seconds(1));
-		}
-
+						else
+						{
+							Hash256 h = process_block_msg(msg);
+							std::erase_if(asked_blocks, [&](const Hash256 & elm) { return h == elm; });
+						}
+					}
+				}
+			});
 		get_block_hashes_fiber.join();
 		for (auto & f : get_blocks_fibers)
 			f.join();
@@ -1210,8 +1178,8 @@ struct network
 	{
 		std::string_view data(msg.body.data(), msg.body.size());
 
-		auto bc_proxy = bc.lock();
 		size_t ninv = consume_var_int(data);
+		auto bc_proxy = bc.lock();
 		for (size_t i=0 ; i<ninv ; i++)
 		{
 			std::uint32_t type = consume_little_endian<decltype(type)>(data);
@@ -1220,9 +1188,10 @@ struct network
 			switch(type)
 			{
 				case MSG_BLOCK:
-					if (bc_proxy->has(h))
-						continue;
-					missing_blocks.push_back(h);
+					if ( ! bc_proxy->has(h)) {
+						missing_blocks.push_back(h);
+						//std::cout << h << std::endl;
+					}
 					break;
 			}
 		}
@@ -1249,72 +1218,7 @@ struct network
 		}
 		return result;
 	}
-	bool process_block_msg(const message & msg, const Hash256 & supposed_block_hash)
-	{
-		//std::cout << "msg: " << std::hex << msg << std::dec << std::endl;
-		std::string_view data(msg.body.data(), msg.body.size());
-
-		block bl;
-		Hash256 hash;
-
-		try { // parsing might throw
-			// std::string block_hash = dbl_sha256({data.data(), 80});
-			// std::reverse(block_hash.begin(), block_hash.end());
-			// pxln(block_hash.data(), 32);
-
-			// unsigned char * announced_previous_block_hash = (unsigned char*)data.data()+4;
-			// if ( ! bc.is_block_hash_close_to_tip(announced_previous_block_hash))
-			// {
-			// 	std::cout << "BLOCK DROPPED: previous block not in cache." << std::endl;
-			// 	return;
-			// }
-
-			std::tie(bl, hash) = consume_header(data, false);
-			if (hash != supposed_block_hash) {
-				//std::cout << "Was expecting " << supposed_block_hash
-				//		<< ", got " << hash << std::endl;
-				return false;
-			}
-
-			auto ntx = consume_var_int(data);
-			std::vector<Hash256> txids;
-			txids.reserve(ntx);
-			for (int i=0 ; i<ntx ; i++)
-			{
-				const char * tx_begin = data.data();
-				bl.txs.push_back(consume_tx(data));
-				const char * tx_end = data.data();
-				std::string_view tx_sv((char*)tx_begin, std::distance(tx_begin, tx_end));
-				//pxln(tx_sv);
-				txids.emplace_back();
-				fill_dbl_sha256(txids.back(), tx_sv);
-				//std::cout << std::hex << txids.back() << std::dec << std::endl;
-			}
-
-			Hash256 merkle_root;
-			fill_merkle_root(merkle_root, std::move(txids));
-			if (bl.merkle_root != merkle_root) {
-				std::cout << "Invalid merkle root: " << std::endl
-				          << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
-				          << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
-				return false;
-			}
-			//std::cout << "ntx: " << ntx << std::endl;
-			//if (ntx > 1)
-			//	for (int i=0 ; i<ntx ; i++)
-			//		std::cout << "tx " << i << std::endl
-			//				<< bl.txs[i] << std::endl;
-		} catch (std::exception & e) {
-			return false;
-		}
-
-		//std::cout << "Got block: " << std::hex << bl.prev_block_hash << " <- " << hash << std::dec << std::endl;
-
-		bc->add(std::string_view(msg.body.data(), msg.body.size()), hash, bl.prev_block_hash);
-
-		return true;
-	}
-	Hash256 process_block_msg_2(const message & msg)
+	Hash256 process_block_msg(const message & msg)
 	{
 		//std::cout << "msg: " << std::hex << msg << std::dec << std::endl;
 		std::string_view data(msg.body.data(), msg.body.size());
