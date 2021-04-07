@@ -25,6 +25,8 @@ typedef boost::error_info<struct tag_stacktrace, boost::stacktrace::stacktrace> 
 #include "sha256sum.hpp"
 #include "blockchain.hpp"
 #include "misc.hpp"
+#include "block_verifier.hpp"
+#include "block_parsing.hpp"
 
 namespace ournode {
 
@@ -32,163 +34,6 @@ namespace ournode {
 #define MSG_BLOCK 2
 // node services
 #define NODE_NETWORK 1
-
-
-std::uint32_t calculate_checksum(unsigned char * data, size_t len)
-{
-	Hash256 hash;
-	fill_dbl_sha256(hash, std::string_view((char*)data, len));
-	return hash.hash_hash;
-}
-
-bool recv_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::mutable_buffer buffer, std::chrono::seconds timeout)
-{
-	boost::fibers::promise<bool> promise;
-	boost::fibers::future<bool> future(promise.get_future());
-
-		//utttil::LogWithPrefix log("recv_bytes");
-		//log.add(std::cout);
-
-	//int x = rand();
-	//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " async_read " << x << std::endl;
-	boost::asio::async_read(socket, buffer, 
-		[/*&log,&x,*/promise=std::move(promise)](const boost::system::error_code& ec, std::size_t bytes_transferred) mutable {
-			//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " async_read done " << x << std::endl;
-			promise.set_value(!ec);
-		});
-	if (future.wait_for(timeout) != boost::fibers::future_status::ready) {
-		socket.cancel();
-		return false;
-	}
-	return future.get();
-}
-bool send_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::const_buffer buffer, std::chrono::seconds timeout)
-{
-	boost::fibers::promise<bool> promise;
-	boost::fibers::future<bool> future(promise.get_future());
-	
-	//pxln({buf.get(), buffer.size()});
-	socket.async_send(buffer, [promise=std::move(promise)](const boost::system::error_code & ec, std::size_t bytes_transferred) mutable {
-			promise.set_value(!ec);
-		});
-	if (future.wait_for(timeout) != boost::fibers::future_status::ready) {
-		return false;
-	}
-	return future.get();
-}
-
-
-struct net_addr
-{
-	std::uint32_t time;
-	std::uint64_t services = 0;
-	char addr[16] = {0};
-	std::uint16_t port = 0;
-
-	std::string to_string() const
-	{
-		bool ten_zeroes = std::find_if(&addr[0], &addr[10], [](unsigned char c) { return c!=0; }) >= &addr[10];
-		if (ten_zeroes) {
-			std::string_view sv((char*)&addr[12], 4);
-			return boost::asio::ip::address_v4(consume_big_endian<unsigned int>(sv)).to_string();
-		} else {
-			std::array<unsigned char, 16> a;
-			std::copy(addr, addr+16, a.data());
-			return boost::asio::ip::address_v6(a).to_string();
-		}
-	}
-};
-
-net_addr consume_net_addr(std::string_view & sv, bool has_time)
-{
-	net_addr a;
-	if (has_time)
-		a.time = consume_little_endian<decltype(a.time)>(sv);
-	a.services = consume_little_endian<decltype(a.services)>(sv);
-	consume_bytes(sv, a.addr, 16);
-	a.port     = consume_big_endian<decltype(a.port    )>(sv);
-	return a; // counting of copy elision
-}
-
-std::tuple<block,Hash256> consume_header(std::string_view & data, bool consume_ntx)
-{
-	if (data.size() < 81)
-		throw std::invalid_argument("data.size() < 81");
-
-	Hash256 hash;
-	fill_dbl_sha256(hash, std::string_view(data.data(), 80));
-
-	block header;	
-	header.version = consume_little_endian<std::int32_t>(data);
-	consume_bytes(data, (char*)header.prev_block_hash.h, 32);
-	consume_bytes(data, (char*)header.merkle_root.h, 32);
-	header.timestamp  = consume_little_endian<std::uint32_t>(data);
-	header.difficulty = consume_little_endian<std::uint32_t>(data);
-	header.nonce =  consume_little_endian<std::uint32_t>(data);
-	if (consume_ntx)
-		consume_var_int(data);
-	return {header, hash};
-}
-
-
-txin consume_vin(std::string_view & data)
-{
-	txin in;
-	memcpy(in.txid.h, data.data(), 32);
-	data.remove_prefix(32);
-	in.idx = consume_little_endian<std::uint32_t>(data);
-	in.script_size = consume_var_int(data);
-	in.scriptsig.reset(new unsigned char[in.script_size], std::default_delete<unsigned char[]>());
-	memcpy(in.scriptsig.get(), data.data(), in.script_size);
-	data.remove_prefix(in.script_size);
-	in.sequence = consume_little_endian<uint32_t>(data);
-	return in;
-}
-txout consume_vout(std::string_view & data)
-{
-	txout out;
-	out.amount = consume_little_endian<std::int64_t>(data);
-	out.script_size = consume_var_int(data);
-	out.scriptpubkey.reset(new unsigned char[out.script_size], std::default_delete<unsigned char[]>());
-	memcpy(out.scriptpubkey.get(), data.data(), out.script_size);
-	data.remove_prefix(out.script_size);
-	return out;
-}
-void consume_witness(std::string_view & data)
-{
-	auto witness_count = consume_var_int(data);
-	for (decltype(witness_count) i=0 ; i<witness_count ; i++)
-	{
-		auto witness_size = consume_var_int(data);
-		data.remove_prefix(witness_size);
-	}
-}
-
-transaction consume_tx(std::string_view & data)
-{
-	transaction tx;
-
-	auto version = consume_little_endian<std::int32_t>(data);
-
-	tx.has_witness = false;
-	if (data.data()[0] == 0) {
-		std::cout << "has witness" << std::endl;
-		tx.has_witness = true;
-		data.remove_prefix(2);
-	}
-	auto nin = consume_var_int(data);
-	for (decltype(nin) i=0 ; i<nin ; i++)
-		tx.inputs.emplace_back(consume_vin(data));
-	auto nout = consume_var_int(data);
-	for (decltype(nout) i=0 ; i<nout ; i++)
-		tx.outputs.emplace_back(consume_vout(data));
-	if (tx.has_witness)
-		consume_witness(data);
-	tx.locktime = consume_little_endian<std::uint32_t>(data);
-
-	return tx;
-}
-
 
 inline static const unsigned int g_testnet_magic_number = 0x0709110b;
 inline static const          int g_version              = 0x00011180;
@@ -462,7 +307,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 			net.bytes_sent += m.byte_count();
 			return true;
 		} else {
-			quality = peer_config::Quality::Unresponsive;
+			quality = peer_config::Quality::Unknown;
 			socket.close();
 			status  = Closed;
 		}
@@ -588,7 +433,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 	{
 		message result;
 		if ( ! result.recv(this->socket, std::chrono::seconds(600))) {
-			quality = peer_config::Quality::Unresponsive;
+			quality = peer_config::Quality::Unknown;
 			socket.close();
 			status  = Closed;
 		} else {
@@ -937,7 +782,10 @@ struct network
 	int32_t peer_block_height = 0;
 	std::list<Hash256> missing_blocks;
 
+	block_verifier & verifier;
+
 	bool go_on;
+	std::thread t;
 
 	// network stats
 	size_t bytes_rcvd = 0;
@@ -948,19 +796,36 @@ struct network
 	boost::fibers::fiber keep_printing_stats_fiber;
 	boost::fibers::fiber keep_saving_conf_fiber;
 
-	network(utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> & conf_, utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_)
+	utttil::LogWithPrefix log;
+	
+	network(utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> & conf_, utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_, block_verifier & verifier_)
 		: io_context(std::make_shared<boost::asio::io_context>())
 		, conf(conf_)
 		, bc(bc_)
 		, my_peer_manager(*this)
-	{}
+		, verifier(verifier_)
+		, log("network")
+	{
+		log.add(std::cout);
+	}
+	~network()
+	{
+		stop();
+	}
+	void join()
+	{
+		t.join();
+	}
 	void stop()
 	{
 		go_on = false;
-		//my_peer_manager.stop();
 		io_context->stop();
+		join();
 	}
-
+	void start()
+	{
+		t = std::thread([&](){ this->run(); });
+	}
 	void run()
 	{
 		go_on = true;
@@ -1031,21 +896,24 @@ struct network
 
 	void print_stats()
 	{
+		utttil::LogWithPrefix log("net stats");
+		log.add(std::cout);
+
 		static size_t bytes_sent_then = 0;
 		static size_t bytes_rcvd_then = 0;
 		static auto then = std::chrono::system_clock::now();
 
-		std::cout << "Handshaken with " << peers.size()+my_peer_manager.handshaken_peers->size()+my_peer_manager.peers_in_use.size() << std::endl;
+		log << utttil::LogLevel::INFO << "Handshaken with " << peers.size()+my_peer_manager.handshaken_peers->size()+my_peer_manager.peers_in_use.size() << std::endl;
 		{
 			auto bc_proxy = bc.lock();
-			bc_proxy->print(0);
-			std::cout << bc_proxy->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
+			bc_proxy->print(log, utttil::LogLevel::INFO);
+			log << utttil::LogLevel::INFO << bc_proxy->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
 		}
 		auto now = std::chrono::system_clock::now();
 		auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now-then).count();
 		if (milliseconds != 0) {
-			std::cout << "Sending bytes: " << (this->bytes_sent-bytes_sent_then) / milliseconds << " kB/s. : " << 8*(this->bytes_sent-bytes_sent_then) / milliseconds << " kb/s." << std::endl;
-			std::cout << "Recving bytes: " << (this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kB/s. : " << 8*(this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kb/s." << std::endl;
+			log << utttil::LogLevel::INFO << "Sending bytes: " << (this->bytes_sent-bytes_sent_then) / milliseconds << " kB/s. : " << 8*(this->bytes_sent-bytes_sent_then) / milliseconds << " kb/s." << std::endl;
+			log << utttil::LogLevel::INFO << "Recving bytes: " << (this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kB/s. : " << 8*(this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kb/s." << std::endl;
 		}
 		then = now;
 		bytes_sent_then = this->bytes_sent;
@@ -1220,65 +1088,21 @@ struct network
 	}
 	Hash256 process_block_msg(const message & msg)
 	{
-		//std::cout << "msg: " << std::hex << msg << std::dec << std::endl;
-		std::string_view data(msg.body.data(), msg.body.size());
-
+		//log << utttil::LogLevel::INFO << "process_block_msg" << std::endl;
 		block bl;
 		Hash256 hash;
 
-		try { // parsing might throw
-			// std::string block_hash = dbl_sha256({data.data(), 80});
-			// std::reverse(block_hash.begin(), block_hash.end());
-			// pxln(block_hash.data(), 32);
-
-			// unsigned char * announced_previous_block_hash = (unsigned char*)data.data()+4;
-			// if ( ! bc.is_block_hash_close_to_tip(announced_previous_block_hash))
-			// {
-			// 	std::cout << "BLOCK DROPPED: previous block not in cache." << std::endl;
-			// 	return;
-			// }
-
+		try { 
+			std::string_view data(msg.body.data(), msg.body.size());
 			std::tie(bl, hash) = consume_header(data, false);
-
-			auto ntx = consume_var_int(data);
-			std::vector<Hash256> txids;
-			txids.reserve(ntx);
-			for (int i=0 ; i<ntx ; i++)
-			{
-				const char * tx_begin = data.data();
-				bl.txs.push_back(consume_tx(data));
-				const char * tx_end = data.data();
-				std::string_view tx_sv((char*)tx_begin, std::distance(tx_begin, tx_end));
-				//pxln(tx_sv);
-				txids.emplace_back();
-				fill_dbl_sha256(txids.back(), tx_sv);
-				//std::cout << std::hex << txids.back() << std::dec << std::endl;
-			}
-
-			Hash256 merkle_root;
-			fill_merkle_root(merkle_root, std::move(txids));
-			if (bl.merkle_root != merkle_root) {
-				std::cout << "Invalid merkle root: " << std::endl
-				          << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
-				          << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
-				hash.zero();
-				return hash;
-			}
-			//std::cout << "ntx: " << ntx << std::endl;
-			//if (ntx > 1)
-			//	for (int i=0 ; i<ntx ; i++)
-			//		std::cout << "tx " << i << std::endl
-			//				<< bl.txs[i] << std::endl;
+			verifier.add_candidate(std::string_view(msg.body.data(), msg.body.size()), hash);
+			//log << utttil::LogLevel::INFO << "OK" << std::endl;
+			return hash;
 		} catch (std::exception & e) {
+			//log << utttil::LogLevel::INFO << "NOK" << std::endl;
 			hash.zero();
 			return hash;
 		}
-
-		//std::cout << "Got block: " << std::hex << bl.prev_block_hash << " <- " << hash << std::dec << std::endl;
-
-		bc->add(std::string_view(msg.body.data(), msg.body.size()), hash, bl.prev_block_hash);
-
-		return hash;
 	}
 };
 

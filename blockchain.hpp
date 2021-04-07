@@ -457,9 +457,9 @@ struct blockchain
 			 ;
 	}
 
-	void print(int indent)
+	void print(utttil::LogWithPrefix & log, const utttil::LogLevel & level)
 	{
-		std::cout << std::string(2*indent, ' ') << "root chain " << root_chain.size() << std::endl;
+		log << level << "root chain " << root_chain.size() << std::endl;
 		//for (auto & block : root_chain.blocks)
 		//	std::cout << std::string(2*indent+2, ' ') << block.prev_block_hash << std::endl;
 		//if (root_chain.size() != 0)
@@ -471,12 +471,12 @@ struct blockchain
 		//std::cout << std::string(2*indent, ' ') << "orphan chains:" << std::endl;
 		//for (auto & orphan : orphan_chains)
 		//	orphan->print(indent+1);
-		std::cout << std::string(2*indent, ' ')
-		          << std::accumulate(branches.begin(), branches.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> &bhm) { return s + bhm->size(); })
-		          << " in " << branches.size() << " branched chains." << std::endl;
-		std::cout << std::string(2*indent, ' ')
-		          << std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> &bhm) { return s + bhm->size(); })
-		          << " in " << orphan_chains.size() << " orphan chains." << std::endl;
+		log << level
+		    << std::accumulate(branches.begin(), branches.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> &bhm) { return s + bhm->size(); })
+		    << " in " << branches.size() << " branched chains." << std::endl;
+		log << level
+		    << std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> &bhm) { return s + bhm->size(); })
+		    << " in " << orphan_chains.size() << " orphan chains." << std::endl;
 	}
 };
 

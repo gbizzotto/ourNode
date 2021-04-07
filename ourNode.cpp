@@ -2,10 +2,12 @@
 //#include <csignal>
 //#include <iostream>
 
+#include "synchronized.hpp"
+
 #include "config.hpp"
 #include "network.hpp"
 #include "blockchain.hpp"
-#include "synchronized.hpp"
+#include "block_verifier.hpp"
 
 //ournode::network *g_net = nullptr;
 //
@@ -48,8 +50,11 @@ int main()
 	bc->load("./testnet"); // select different folders for testnet3/mainnet
 	check_integrity(bc);
 
-	ournode::network net(conf, bc);
-	std::thread network_thread([&]() { net.run(); });
+	ournode::block_verifier verifier(bc);
+	verifier.start();
+
+	ournode::network net(conf, bc, verifier);
+	net.start();
 
 	// ctrlc handling
 	//g_net = &net;
@@ -60,7 +65,8 @@ int main()
 	//sigaction(SIGINT, &sigIntHandler, NULL);
 
 	// shutdown
-	network_thread.join();
+	net.join();
+	verifier.join();
 	conf->save();
 	std::cout << "Stopped gracefully" << std::endl;
 	return 0;
