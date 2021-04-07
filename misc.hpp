@@ -12,12 +12,17 @@ bool in(const typename C::key_type & t, const C & c)
 {
 	return c.find(t) != std::end(c);
 }
+template<typename T>
+bool in(const typename std::set<T>::key_type & t, const std::set<T> & c)
+{
+	return c.find(t) != std::end(c);
+}
 template<typename C>
-const typename C::value_type & random(const C & c)
+const typename C::iterator random(const C & c)
 {
 	if (c.size() == 1)
-		return *c.begin();
-	return *std::next(c.begin(), rand()%(c.size()-1));
+		return c.begin();
+	return std::next(c.begin(), rand()%(c.size()-1));
 }
 
 

@@ -1,6 +1,7 @@
 
 #pragma once
 
+#include <list>
 #include <set>
 #include <unordered_set>
 #include <cstring>
@@ -18,6 +19,7 @@ typedef boost::error_info<struct tag_stacktrace, boost::stacktrace::stacktrace> 
 
 #include "synchronized.hpp"
 #include "observable.hpp"
+#include "log.hpp"
 
 #include "config.hpp"
 #include "sha256sum.hpp"
@@ -43,9 +45,15 @@ bool recv_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::mutable_buff
 {
 	boost::fibers::promise<bool> promise;
 	boost::fibers::future<bool> future(promise.get_future());
-	
+
+		//utttil::LogWithPrefix log("recv_bytes");
+		//log.add(std::cout);
+
+	//int x = rand();
+	//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " async_read " << x << std::endl;
 	boost::asio::async_read(socket, buffer, 
-		[promise=std::move(promise)](const boost::system::error_code& ec, std::size_t bytes_transferred) mutable {
+		[/*&log,&x,*/promise=std::move(promise)](const boost::system::error_code& ec, std::size_t bytes_transferred) mutable {
+			//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " async_read done " << x << std::endl;
 			promise.set_value(!ec);
 		});
 	if (future.wait_for(timeout) != boost::fibers::future_status::ready) {
@@ -197,7 +205,7 @@ struct message
 	std::string command;
 	std::uint32_t len;
 	std::uint32_t checksum;
-
+	
 	message() = default;
 	message(const std::string cmd)
 		: command(cmd)
@@ -350,7 +358,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		: net(net_)
 		, socket(*net_.io_context)
 		, nonce((((uint64_t)rand()) << 32) + rand())
-		, my_peer_config(std::move(peer_config_))
+		, my_peer_config(peer_config_)
 		, status(Closed)
 		, quality(q)
 	{}
@@ -510,6 +518,19 @@ struct peer : std::enable_shared_from_this<peer<network>>
 		m.append_var_int(1);
 		m.append_little_endian(std::uint32_t(MSG_BLOCK));
 		m.append_bytes(last_known_hash.h, 32);
+
+		send(m);
+	}
+	void send_block_getdata_msg(const std::list<Hash256> & hashes)
+	{
+		message m("getdata");
+
+		m.append_var_int(hashes.size());
+		for (const Hash256 & h : hashes)
+		{
+			m.append_little_endian(std::uint32_t(MSG_BLOCK));
+			m.append_bytes(h.h, 32);
+		}
 
 		send(m);
 	}
@@ -718,8 +739,8 @@ struct peer_manager
 
 	std::shared_ptr<boost::asio::io_context> io_context;
 
-	std::map<peer_config, peer_sptr> closed_good_peers;
-	std::map<peer_config, peer_sptr> closed_unknown_peers;
+	std::set<peer_config> closed_good_peers;
+	std::set<peer_config> closed_unknown_peers;
 	std::map<peer_config, peer_sptr> opening_peers;
 	utttil::synchronized<std::map<peer_config, peer_sptr>, boost::fibers::mutex, boost::fibers::condition_variable> handshaken_peers;
 	std::map<peer_config, peer_sptr> peers_in_use;
@@ -769,14 +790,15 @@ struct peer_manager
 				opening_peers.erase(p->get_config());
 				//std::cout << "lock handshaken_peers 3" << std::endl;
 				handshaken_peers->erase(p->get_config());
+				peers_in_use.erase(p->get_config());
 				//std::cout << "unlock handshaken_peers 3" << std::endl;
 				//std::cout << "lock 5" << std::endl;
 				auto q = net.conf->get_quality(p->get_config());
 				//std::cout << "unlock 5" << std::endl;
 				if (q == peer_config::Quality::Good)
-					closed_good_peers.insert({p->get_config(), p});
+					closed_good_peers.insert(p->get_config());
 				else if (q == peer_config::Quality::Unknown)
-					closed_unknown_peers.insert({p->get_config(), p});
+					closed_unknown_peers.insert(p->get_config());
 				break;
 		}
 		check_need_more_tries();
@@ -797,19 +819,10 @@ struct peer_manager
 			{
 				continue;
 			}
-			auto new_peer = std::make_shared<peer<network>>(net, p.first, p.second);
-			new_peer->quality.observe([new_peer,self=this](const peer_config::Quality & before, const peer_config::Quality & after)
-				{
-					self->quality_change_callback(new_peer, before, after);
-				});
-			new_peer->status.observe([new_peer,self=this](const typename peer<network>::Status & before, const typename peer<network>::Status & after)
-				{
-					self->status_change_callback(new_peer, before, after);
-				});
 			if (p.second == peer_config::Quality::Good)
-				closed_good_peers.insert({new_peer->get_config(), new_peer});
+				closed_good_peers.insert(p.first);
 			else if (p.second == peer_config::Quality::Unknown)
-				closed_unknown_peers.insert({new_peer->get_config(), new_peer});
+				closed_unknown_peers.insert(p.first);
 		}
 	}
 
@@ -820,7 +833,7 @@ struct peer_manager
 		{
 			//std::cout << "lock 2" << std::endl;
 			auto proxy = net.conf.lock();
-			parallel_connections_max = proxy->parallel_connections_max;
+			parallel_connections_max   = proxy->parallel_connections_max;
 			parallel_connections_ratio = proxy->parallel_connections_ratio;
 			//std::cout << "unlock 2" << std::endl;
 		}
@@ -838,15 +851,28 @@ struct peer_manager
 		{
 			if (closed_good_peers.empty() && closed_unknown_peers.empty())
 				load_from_conf();
-			if ( ! closed_good_peers.empty())
+			if ( ! closed_good_peers.empty() || ! closed_unknown_peers.empty())
 			{
-				auto p = random(closed_good_peers).second;
-				p->start();
-			}
-			else if ( ! closed_unknown_peers.empty())
-			{
-				auto p = random(closed_unknown_peers).second;
-				p->start();
+				std::shared_ptr<peer<network>> new_peer;
+				if ( ! closed_good_peers.empty()) {
+					auto it = random(closed_good_peers);
+					new_peer = std::make_shared<peer<network>>(net, *it, peer_config::Quality::Good);
+					closed_good_peers.erase(it);
+				} else {
+					auto it = random(closed_unknown_peers);
+					new_peer = std::make_shared<peer<network>>(net, *it, peer_config::Quality::Unknown);
+					closed_unknown_peers.erase(it);
+				}
+				new_peer->quality.observe([new_peer,self=this](const peer_config::Quality & before, const peer_config::Quality & after)
+					{
+						self->quality_change_callback(new_peer, before, after);
+					});
+				new_peer->status.observe([new_peer,self=this](const typename peer<network>::Status & before, const typename peer<network>::Status & after)
+					{
+						self->status_change_callback(new_peer, before, after);
+					});
+				new_peer->start();
+				opening_peers.insert({new_peer->get_config(), new_peer});
 			}
 		}
 	}
@@ -885,14 +911,15 @@ struct peer_manager
 				opening_peers.erase(p->get_config());
 				//std::cout << "lock handshaken_peers 5" << std::endl;
 				handshaken_peers->erase(p->get_config());
+				peers_in_use.erase(p->get_config());
 				//std::cout << "unlock handshaken_peers 4" << std::endl;
 				//std::cout << "lock 6" << std::endl;
 				auto q = net.conf->get_quality(p->get_config());
 				//std::cout << "unlock 6" << std::endl;
 				if (q == peer_config::Quality::Good)
-					closed_good_peers.insert({p->get_config(), p});
+					closed_good_peers.insert(p->get_config());
 				else if (q == peer_config::Quality::Unknown)
-					closed_unknown_peers.insert({p->get_config(), p});
+					closed_unknown_peers.insert(p->get_config());
 				break;
 		}
 	}
@@ -908,7 +935,7 @@ struct network
 	std::vector<std::shared_ptr<peer<network>>> peers;
 
 	int32_t peer_block_height = 0;
-	std::deque<Hash256> missing_blocks;
+	std::list<Hash256> missing_blocks;
 
 	bool go_on;
 
@@ -959,9 +986,7 @@ struct network
 
 	void keep_well_connected()
 	{
-		//std::cout << "lock 7" << std::endl;
 		auto min_peer_count = conf->min_peer_count;
-		//std::cout << "unlock 7" << std::endl;
 		for ( ; go_on ; boost::this_fiber::sleep_for(std::chrono::seconds(1)))
 		{
 			while (peers.size() < min_peer_count && go_on) {
@@ -976,15 +1001,11 @@ struct network
 						return true;
 					if (p->quality == peer_config::Quality::Rejected) {
 						//std::cout << "Rejecting " << p->get_config().ip << " " << p->get_config().port << std::endl;
-						//std::cout << "lock 8" << std::endl;
 						conf->set_peer_quality(p->get_config(), p->quality);
-						//std::cout << "unlock 8" << std::endl;
 						return true;
 					} else if (p->quality == peer_config::Quality::Unresponsive) {
 						//std::cout << "Timed out " << p->get_config().ip << " " << p->get_config().port << std::endl;
-						//std::cout << "lock 9" << std::endl;
 						conf->set_peer_quality(p->get_config(), p->quality);
-						//std::cout << "unlock 9" << std::endl;
 						return true;
 					} else if (p->status == peer<network>::Status::Closed) {
 						//std::cout << "Closed " << p->get_config().ip << " " << p->get_config().port << std::endl;
@@ -1004,9 +1025,7 @@ struct network
 	{
 		for ( ; go_on ; boost::this_fiber::sleep_for(std::chrono::seconds(10)))
 		{
-			//std::cout << "lock 11" << std::endl;
 			conf->save();
-			//std::cout << "unlock 11" << std::endl;
 		}
 	}
 
@@ -1017,10 +1036,11 @@ struct network
 		static auto then = std::chrono::system_clock::now();
 
 		std::cout << "Handshaken with " << peers.size()+my_peer_manager.handshaken_peers->size()+my_peer_manager.peers_in_use.size() << std::endl;
-		//std::cout << "lock bc 1" << std::endl;
-		bc->print(0);
-		std::cout << bc->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
-		//std::cout << "unlock bc 1" << std::endl;
+		{
+			auto bc_proxy = bc.lock();
+			bc_proxy->print(0);
+			std::cout << bc_proxy->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
+		}
 		auto now = std::chrono::system_clock::now();
 		auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now-then).count();
 		if (milliseconds != 0) {
@@ -1035,27 +1055,34 @@ struct network
 	void keep_up_to_date()
 	{
 		// initial sync
-		//std::cout << "lock bc 2" << std::endl;
 		if (bc->best_height() == blockchain::no_height)
 			missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
-		//std::cout << "unlock bc 2" << std::endl;
 		do {
 			synchronize_blockchain();
 		} while (bc->best_height() < peer_block_height && go_on);
 
 		for ( ; go_on ; boost::this_fiber::sleep_for(std::chrono::seconds(10)))
-			if (bc->best_height() < peer_block_height || bc->orphan_chains.size() > 0)
+		{
+			auto bc_proxy = bc.lock();
+			if (bc_proxy->best_height() < peer_block_height || bc_proxy->orphan_chains.size() > 0)
 				synchronize_blockchain();
+		}
 	}
 
 	void synchronize_blockchain()
 	{
-		auto get_last_known_block_hash = [&]() -> Hash256
+		utttil::LogWithPrefix log("synchronize_blockchain");
+		log.add(std::cout);
+
+		log << utttil::LogLevel::INFO << "Start synching blockchain." << std::endl;
+
+		auto get_last_known_block_hash = [&]() -> const Hash256 &
 			{
+				auto bc_proxy = bc.lock();
 				if ( ! missing_blocks.empty())
 					return missing_blocks.back();
-				else if (bc->best_height() != blockchain::no_height)
-					return bc->get_last_known_block_hash();
+				else if (bc_proxy->best_height() != blockchain::no_height)
+					return bc_proxy->get_last_known_block_hash();
 				else
 					return blockchain::testnet_genesis_block_hash;
 			};
@@ -1091,14 +1118,14 @@ struct network
 					}
 					my_peer_manager.return_peer(p);
 				}
-				std::cout << "I'm done getting new block hashes." << std::endl;
+				log << utttil::LogLevel::INFO << "I'm done getting new block hashes." << std::endl;
 				downloading_block_list = false;
 			});
 
-		const int max_DL_fibers_count = 50;
+		const int max_DL_fibers_count = 30;
 		std::vector<boost::fibers::fiber> get_blocks_fibers;
 		get_blocks_fibers.reserve(max_DL_fibers_count);
-		while(downloading_block_list && get_blocks_fibers.size() < max_DL_fibers_count && go_on)
+		while((downloading_block_list || ! this->missing_blocks.empty()) && go_on)
 		{
 			int missing_blocks = peer_block_height - bc->best_height();
 			if (missing_blocks < 0) {
@@ -1108,10 +1135,10 @@ struct network
 			while (get_blocks_fibers.size() < std::min(max_DL_fibers_count, missing_blocks) && go_on)
 				get_blocks_fibers.emplace_back([&]()
 					{
-						std::chrono::seconds timeout(10);
-						while (go_on && (downloading_block_list || ! this->missing_blocks.empty()))
+						std::chrono::seconds timeout(20);
+						while((downloading_block_list || ! this->missing_blocks.empty()) && go_on)
 						{
-							while(this->missing_blocks.empty()) {
+							if(this->missing_blocks.empty()) {
 								boost::this_fiber::sleep_for(std::chrono::seconds(1));
 								continue;
 							}
@@ -1120,26 +1147,52 @@ struct network
 								return;
 							//std::cout << "Got peer for get_blocks_fibers" << std::endl;
 							// if we can't get a block every 60s, we'll nevet get that full blockchain
+
+							std::list<Hash256> asked_blocks;
+
 							for ( auto deadline = std::chrono::system_clock::now() + timeout
 								; std::chrono::system_clock::now() < deadline && go_on
 								; )
 							{
-								if (this->missing_blocks.empty()) {
+								if (this->missing_blocks.empty() && asked_blocks.empty()) {
 									boost::this_fiber::sleep_for(std::chrono::seconds(1));
 									continue;
 								}
-								Hash256 h = this->missing_blocks.front();
-								//std::cout << "Getblock fiber get block " << h << std::endl;
-								this->missing_blocks.pop_front();
-								bool rcvd = true;
-								message msg;
-								std::tie(rcvd, msg) = p->get_block(h, timeout);
-								if ( ! rcvd) {
-									this->missing_blocks.push_front(h);
-								} else {
-									deadline = std::chrono::system_clock::now() + timeout;
-									if ( ! process_block_msg(msg, h))
-										this->missing_blocks.push_front(h);
+
+								int blocks_to_get = std::min(1 + (int)this->missing_blocks.size() / max_DL_fibers_count, 100);
+								std::list<Hash256> tmp_list;
+								tmp_list.splice(tmp_list.begin(), this->missing_blocks, this->missing_blocks.begin(), std::next(this->missing_blocks.begin(), blocks_to_get));
+								p->send_block_getdata_msg(tmp_list);
+								asked_blocks.splice(asked_blocks.end(), tmp_list);
+								
+								while( ! asked_blocks.empty())
+								{
+									bool rcvd = true;
+									message msg;
+									//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " Get block " << std::endl;
+									std::tie(rcvd, msg) = p->expect("block", timeout);
+									//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " RCVD block " << std::endl;
+
+									if ( ! rcvd)
+									{
+										std::cout << " ! rcvd" << std::endl;
+										this->missing_blocks.splice(this->missing_blocks.begin(), asked_blocks);
+										break;
+									}
+									else
+									{
+										Hash256 h = process_block_msg_2(msg);
+										std::erase_if(asked_blocks, [&](const Hash256 & elm)
+											{
+												if (h == elm)
+												{
+													//log << utttil::LogLevel::INFO << "got block " << h << std::endl;
+													return true;
+												}
+												return false;
+											});
+										deadline = std::chrono::system_clock::now() + timeout;										
+									}
 								}
 							}
 							my_peer_manager.return_peer(p);
@@ -1157,6 +1210,7 @@ struct network
 	{
 		std::string_view data(msg.body.data(), msg.body.size());
 
+		auto bc_proxy = bc.lock();
 		size_t ninv = consume_var_int(data);
 		for (size_t i=0 ; i<ninv ; i++)
 		{
@@ -1166,7 +1220,7 @@ struct network
 			switch(type)
 			{
 				case MSG_BLOCK:
-					if (bc->has(h))
+					if (bc_proxy->has(h))
 						continue;
 					missing_blocks.push_back(h);
 					break;
@@ -1216,7 +1270,6 @@ struct network
 			// }
 
 			std::tie(bl, hash) = consume_header(data, false);
-
 			if (hash != supposed_block_hash) {
 				//std::cout << "Was expecting " << supposed_block_hash
 				//		<< ", got " << hash << std::endl;
@@ -1242,8 +1295,8 @@ struct network
 			fill_merkle_root(merkle_root, std::move(txids));
 			if (bl.merkle_root != merkle_root) {
 				std::cout << "Invalid merkle root: " << std::endl
-				          << "Block merkle root     : " << std::hex << bl.merkle_root << std::dec << std::endl
-				          << "Calculated merkle root: " << std::hex << merkle_root << std::dec << std::endl;
+				          << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
+				          << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
 				return false;
 			}
 			//std::cout << "ntx: " << ntx << std::endl;
@@ -1251,7 +1304,6 @@ struct network
 			//	for (int i=0 ; i<ntx ; i++)
 			//		std::cout << "tx " << i << std::endl
 			//				<< bl.txs[i] << std::endl;
-
 		} catch (std::exception & e) {
 			return false;
 		}
@@ -1261,6 +1313,68 @@ struct network
 		bc->add(std::string_view(msg.body.data(), msg.body.size()), hash, bl.prev_block_hash);
 
 		return true;
+	}
+	Hash256 process_block_msg_2(const message & msg)
+	{
+		//std::cout << "msg: " << std::hex << msg << std::dec << std::endl;
+		std::string_view data(msg.body.data(), msg.body.size());
+
+		block bl;
+		Hash256 hash;
+
+		try { // parsing might throw
+			// std::string block_hash = dbl_sha256({data.data(), 80});
+			// std::reverse(block_hash.begin(), block_hash.end());
+			// pxln(block_hash.data(), 32);
+
+			// unsigned char * announced_previous_block_hash = (unsigned char*)data.data()+4;
+			// if ( ! bc.is_block_hash_close_to_tip(announced_previous_block_hash))
+			// {
+			// 	std::cout << "BLOCK DROPPED: previous block not in cache." << std::endl;
+			// 	return;
+			// }
+
+			std::tie(bl, hash) = consume_header(data, false);
+
+			auto ntx = consume_var_int(data);
+			std::vector<Hash256> txids;
+			txids.reserve(ntx);
+			for (int i=0 ; i<ntx ; i++)
+			{
+				const char * tx_begin = data.data();
+				bl.txs.push_back(consume_tx(data));
+				const char * tx_end = data.data();
+				std::string_view tx_sv((char*)tx_begin, std::distance(tx_begin, tx_end));
+				//pxln(tx_sv);
+				txids.emplace_back();
+				fill_dbl_sha256(txids.back(), tx_sv);
+				//std::cout << std::hex << txids.back() << std::dec << std::endl;
+			}
+
+			Hash256 merkle_root;
+			fill_merkle_root(merkle_root, std::move(txids));
+			if (bl.merkle_root != merkle_root) {
+				std::cout << "Invalid merkle root: " << std::endl
+				          << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
+				          << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
+				hash.zero();
+				return hash;
+			}
+			//std::cout << "ntx: " << ntx << std::endl;
+			//if (ntx > 1)
+			//	for (int i=0 ; i<ntx ; i++)
+			//		std::cout << "tx " << i << std::endl
+			//				<< bl.txs[i] << std::endl;
+		} catch (std::exception & e) {
+			hash.zero();
+			return hash;
+		}
+
+		//std::cout << "Got block: " << std::hex << bl.prev_block_hash << " <- " << hash << std::dec << std::endl;
+
+		bc->add(std::string_view(msg.body.data(), msg.body.size()), hash, bl.prev_block_hash);
+
+		return hash;
 	}
 };
 

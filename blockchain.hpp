@@ -66,51 +66,56 @@ O & operator<<(O & out, const transaction & tx)
 	out << "vin: " << std::endl;
 	for (int i=0 ; i<tx.inputs.size() ; i++)
 	{
-				out << "  txid: ";
-				pxln(out, std::string_view((char*)tx.inputs[i].txid.h, 32));
-				out << "  idx: " << tx.inputs[i].idx << std::endl;
-				out << "  scriptsig: ";
-				px(out, std::string_view((char*)tx.inputs[i].scriptsig.get(), tx.inputs[i].script_size));
-				out << std::endl;
-				out << "  scriptsig: ";
-				for (unsigned char *ptr=tx.inputs[i].scriptsig.get(),*end=ptr+tx.inputs[i].script_size ; ptr<end ; )
-				{
-					if (*ptr == 0 || *ptr>75) {
-						printf("%02X ", *ptr);
-						ptr++;
-					} else {
-						px(out, std::string_view((char*)ptr+1, *ptr));
-						out << " ";
-						ptr += *ptr + 1;
-					}
-				}
-				out << std::endl;
-				out << "  sequence: " << std::hex << tx.inputs[i].sequence << std::dec << std::endl;
+		out << "  txid: ";
+		pxln(out, std::string_view((char*)tx.inputs[i].txid.h, 32));
+		out << "  idx: " << tx.inputs[i].idx << std::endl;
+		out << "  scriptsig: ";
+		px(out, std::string_view((char*)tx.inputs[i].scriptsig.get(), tx.inputs[i].script_size));
+		out << std::endl;
+		out << "  scriptsig: ";
+		for (unsigned char *ptr = tx.inputs[i].scriptsig.get(), *end = ptr + tx.inputs[i].script_size; ptr < end;)
+		{
+			if (*ptr == 0 || *ptr > 75)
+			{
+				printf("%02X ", *ptr);
+				ptr++;
+			}
+			else
+			{
+				px(out, std::string_view((char*)ptr + 1, *ptr));
+				out << " ";
+				ptr += *ptr + 1;
+			}
+		}
+		out << std::endl;
+		out << "  sequence: " << std::hex << tx.inputs[i].sequence << std::dec << std::endl;
 	}
 	out << "vout: " << std::endl;
 	for (int i=0 ; i<tx.outputs.size() ; i++)
 	{
-				out << "  amount: " << tx.outputs[i].amount << std::endl;
-				out << "  scriptpubkey: ";
-				px(out, std::string_view((char*)tx.outputs[i].scriptpubkey.get(), tx.outputs[i].script_size));
-				out << std::endl;
-				out << "  scriptpubkey: ";
-				for (unsigned char *ptr=tx.outputs[i].scriptpubkey.get(),*end=ptr+tx.outputs[i].script_size ; ptr<end ; )
-				{
-					if (*ptr == 0 || *ptr>75) {
-						printf("%02X ", *ptr);
-						ptr++;
-					} else {
-						px(out, std::string_view((char*)ptr+1, *ptr));
-						out << " ";
-						ptr += *ptr + 1;
-					}
-				}
-				out << std::endl;
+		out << "  amount: " << tx.outputs[i].amount << std::endl;
+		out << "  scriptpubkey: ";
+		px(out, std::string_view((char*)tx.outputs[i].scriptpubkey.get(), tx.outputs[i].script_size));
+		out << std::endl;
+		out << "  scriptpubkey: ";
+		for (unsigned char *ptr = tx.outputs[i].scriptpubkey.get(), *end = ptr + tx.outputs[i].script_size; ptr < end;)
+		{
+			if (*ptr == 0 || *ptr > 75)
+			{
+				printf("%02X ", *ptr);
+				ptr++;
+			}
+			else
+			{
+				px(out, std::string_view((char*)ptr + 1, *ptr));
+				out << " ";
+				ptr += *ptr + 1;
+			}
+		}
+		out << std::endl;
 	}
 	return out;
 }
-
 
 struct block_hash_map
 {
@@ -122,6 +127,10 @@ struct block_hash_map
 	index_list index_by_hash_hash;
 
 	std::filesystem::path folder;
+
+	std::ofstream foutdata;
+	std::uint32_t file_number=0;
+	std::ofstream foutindex;
 
 	static inline Hash256 no_hash;
 
@@ -135,42 +144,45 @@ struct block_hash_map
 	void load(std::filesystem::path p)
 	{
 		folder = p;
-
-		std::filesystem::create_directory(p);
-
+		std::filesystem::create_directory(folder);
+		
 		auto index_path = folder / "index";
-		if ( ! std::filesystem::exists(index_path))
-			return;
-		auto index_entries_count = std::filesystem::file_size(index_path) / (32+4+4);
-		accomodate_new_size(index_entries_count);
-
-		std::ifstream fin(index_path, std::ios_base::in | std::ios_base::binary);
-		for (;;)
+		if (std::filesystem::exists(index_path))
 		{
-			block_handle handle;
-			consume_bytes(fin, (char*)handle.hash.h, 32);
-			if (fin.eof())
-				break;
-			handle.file_number = consume_little_endian<decltype(handle.file_number)>(fin);
-			handle.offset      = consume_little_endian<decltype(handle.offset     )>(fin);	
-			if (fin.eof())
-				break;
-			this->add_nocheck(handle, false);
+			auto index_entries_count = std::filesystem::file_size(index_path) / (32+4+4);
+			accomodate_new_size(index_entries_count);
+
+			std::ifstream fin(index_path, std::ios_base::in | std::ios_base::binary);
+			for (;;)
+			{
+				block_handle handle;
+				consume_bytes(fin, (char*)handle.hash.h, 32);
+				if (fin.eof())
+					break;
+				handle.file_number = consume_little_endian<decltype(handle.file_number)>(fin);
+				handle.offset      = consume_little_endian<decltype(handle.offset     )>(fin);
+				if (fin.eof())
+					break;
+				this->add_nocheck(handle, false);
+				file_number = handle.file_number;
+			}
+			fin.close();
+			std::cout << "Resuming from block height: " << best_height() << ' ' << get_last_known_block_hash() << std::endl;
 		}
-		std::cout << "Resuming from block height: " << best_height() << ' ' << get_last_known_block_hash() << std::endl;
+		foutindex.open(index_path, std::ios_base::app | std::ios_base::binary);
+		foutdata.open(folder / std::to_string(file_number), std::ios_base::app | std::ios_base::binary);
 	}
 	block_handle write_block_data(std::string_view sv, const Hash256 & block_hash)
 	{
 		block_handle result;
 		result.hash = block_hash;
-		result.block_data.clear();
 
 		// determine file and offset
 		fill_file_pos(result);
 
 		// write at file+offset
-		std::ofstream fout(folder / std::to_string(result.file_number), std::ios_base::app | std::ios_base::binary);
-		fout.write(sv.data(), sv.size());
+		serialize_little_endian(foutdata, (std::uint32_t)sv.size());
+		serialize_bytes(foutdata, (char*)sv.data(), sv.size());
 
 		write_index(result);
 
@@ -182,7 +194,7 @@ struct block_hash_map
 		result.hash = block_hash;
 		result.block_data = sv;
 		result.file_number = 0;
-		result.offset      = 0;	
+		result.offset      = 0;
 		return result;
 	}
 	void write(block_handle & handle)
@@ -190,8 +202,9 @@ struct block_hash_map
 		fill_file_pos(handle);
 
 		// write at file+offset
-		std::ofstream fout(folder / std::to_string(handle.file_number), std::ios_base::app | std::ios_base::binary);
-		fout.write(handle.block_data.data(), handle.block_data.size());
+		serialize_little_endian(foutdata, (std::uint32_t)handle.block_data.size());
+		serialize_bytes(foutdata, (char*)handle.block_data.data(), handle.block_data.size());
+		handle.block_data = std::string();
 
 		write_index(handle);
 	}
@@ -202,12 +215,14 @@ struct block_hash_map
 			handle.file_number = 0;
 			handle.offset      = 0;
 		} else {
-			auto file_number = block_handles.back().file_number;
 			std::filesystem::path file_path = folder / std::to_string(file_number);
 			auto file_size = std::filesystem::file_size(file_path);
 			if (file_size > 4'000'000'000ull) {
-				handle.file_number = file_number + 1;
+				file_number++;
+				handle.file_number = file_number;
 				handle.offset      = 0;
+				foutdata.close();
+				foutdata.open(folder / std::to_string(file_number), std::ios_base::app | std::ios_base::binary);
 			} else {
 				handle.file_number = file_number;
 				handle.offset      = file_size;
@@ -217,15 +232,41 @@ struct block_hash_map
 	void write_index(block_handle & handle)
 	{
 		auto index_path = folder / "index";
-		std::ofstream fout(index_path, std::ios_base::app | std::ios_base::binary);
-		serialize_bytes(fout, (char*)handle.hash.h, 32);
-		serialize_little_endian(fout, handle.file_number);
-		serialize_little_endian(fout, handle.offset);
+		serialize_bytes(foutindex, (char*)handle.hash.h, 32);
+		serialize_little_endian(foutindex, handle.file_number);
+		serialize_little_endian(foutindex, handle.offset);
+	}
+
+	template <typename F>
+	void get_raw_block_headers(F callback) const
+	{
+		std::ifstream fin;
+		int file_name = -1;
+		for (const block_handle & bh : block_handles)
+		{
+			if (file_name != bh.file_number)
+			{
+				auto new_file_name = folder / std::to_string(bh.file_number);
+				if ( ! std::filesystem::exists(new_file_name))
+					return;
+				fin.close();
+				fin.open(new_file_name, std::ios_base::in | std::ios_base::binary);
+				file_name = bh.file_number;
+			}
+			if (fin.eof())
+				return;
+			fin.seekg(bh.offset);
+			char buffer[81];
+			consume_little_endian<std::uint32_t>(fin);
+			consume_bytes(fin, buffer, 81);
+			if ( ! callback(std::string_view(buffer, 81)))
+				break;
+		}
 	}
 
 	void merge_nocheck(block_hash_map && other)
 	{
-		accomodate_new_size(size()+other.size());
+		accomodate_new_size(size() + other.size());
 		for (auto & handle : other.block_handles)
 			add_nocheck(handle, true);
 	}
@@ -254,8 +295,10 @@ struct block_hash_map
 	}
 	inline void add_nocheck(block_handle & handle, bool write_to_persistent_memory)
 	{
-		if (write_to_persistent_memory && ! folder.empty())
+		if (write_to_persistent_memory && ! folder.empty()) {
 			write(handle);
+			handle.block_data = std::string(); // was cached in a branch or an orphan, now it's on disk
+		}
 
 		accomodate_new_size(size()+1);
 		index_by_hash_hash[index_slot(handle.hash)] = block_handles.size();
@@ -267,16 +310,18 @@ struct block_hash_map
 		if ( ! resize)
 			return;
 		while(new_size > bits)
-			bits = bits*2 + 1; // keep it 2^n-1
-		index_by_hash_hash = index_list((bits+1)*2, no_height);
-		int i=0;
+			bits = bits*2 +1; // keep it 2^n-1
+		//index_by_hash_hash = index_list((bits+1)*2, no_height);
+		index_by_hash_hash.clear();
+		index_by_hash_hash.resize((bits+1)*2, no_height);
+		int i = 0;
 		for (const auto & handle : block_handles)
 			index_by_hash_hash[index_slot(handle.hash)] = i++;
 	}
 	std::uint32_t index_slot(const Hash256 & block_hash) const
 	{
 		uint32_t hash_hash = (block_hash.hash_hash & bits)*2;
-		while (index_by_hash_hash[hash_hash] != no_height)
+		while(index_by_hash_hash[hash_hash] != no_height)
 			hash_hash = (hash_hash+1) & bits;
 		return hash_hash;
 	}
@@ -293,17 +338,22 @@ struct blockchain
 {
 	static inline const Hash256 testnet_genesis_block_hash = 0x000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943_bigendian_sha256;
 	//static inline const Hash256 testnet_genesis_block_hash = 0x00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105_bigendian_sha256;
-	inline static const uint32_t no_height = block_hash_map::no_height;
+	static inline const uint32_t no_height = block_hash_map::no_height;
 
 	block_hash_map root_chain;
 	std::deque<std::unique_ptr<blockchain>> branches;
 	std::deque<std::unique_ptr<blockchain>> orphan_chains;
 
 	Hash256 parent_block_hash;
-	
+
 	void load(std::filesystem::path folder)
 	{
 		root_chain.load(folder);
+	}
+	template <typename F>
+	void get_raw_block_headers(F callback) const
+	{
+		root_chain.get_raw_block_headers(callback);
 	}
 
 	const Hash256 & get_last_known_block_hash() const { return root_chain.get_last_known_block_hash(); }
@@ -312,9 +362,9 @@ struct blockchain
 	bool has(const Hash256 & hash) const
 	{
 		return root_chain.height(hash) != no_height
-		    || std::find_if(branches     .begin(), branches     .end(), [&hash](const std::unique_ptr<blockchain> & bcp){ return bcp->has(hash); }) != branches     .end()
-		    || std::find_if(orphan_chains.begin(), orphan_chains.end(), [&hash](const std::unique_ptr<blockchain> & bcp){ return bcp->has(hash); }) != orphan_chains.end()
-			;
+		    || std::find_if(branches.begin(), branches.end(), [&hash](const std::unique_ptr<blockchain> & bcp) { return bcp->has(hash); }) != branches.end()
+		    || std::find_if(orphan_chains.begin(), orphan_chains.end(), [&hash](const std::unique_ptr<blockchain> & bcp) { return bcp->has(hash); }) != orphan_chains.end()
+		    ;
 	}
 
 	void check_vs_orphans(block_hash_map & bhm)
@@ -341,10 +391,8 @@ struct blockchain
 	void add(std::string_view block_data, const Hash256 & hash, const Hash256 & prev_block_hash, bool is_orphan=false)
 	{
 		//std::cout << "root_chain.size(): " << root_chain.size() << std::endl;
-		if (root_chain.size() == 0)
-		{
-			if (hash == testnet_genesis_block_hash || is_orphan)
-			{
+		if (root_chain.size() == 0) {
+			if (hash == testnet_genesis_block_hash || is_orphan) {
 				this->parent_block_hash = prev_block_hash;
 				root_chain.add_nocheck(block_data, hash);
 				check_vs_orphans(root_chain);
@@ -394,7 +442,7 @@ struct blockchain
 				orphan->add(block_data, hash, prev_block_hash);
 				return;
 			}
-		
+
 		//std::cout << "Added as new orphan block line as orphan" << std::endl;
 		auto new_orphan = std::make_unique<blockchain>();
 		new_orphan->add(block_data, hash, prev_block_hash, true);
@@ -404,8 +452,8 @@ struct blockchain
 	size_t size() const
 	{
 		return root_chain.size()
-		     + std::accumulate(branches     .begin(), branches     .end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm){ return s+bhm->size(); })
-			 + std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm){ return s+bhm->size(); })
+		     + std::accumulate(branches     .begin(), branches     .end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm) { return s + bhm->size(); })
+		     + std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm) { return s + bhm->size(); })
 			 ;
 	}
 
@@ -424,10 +472,10 @@ struct blockchain
 		//for (auto & orphan : orphan_chains)
 		//	orphan->print(indent+1);
 		std::cout << std::string(2*indent, ' ')
-		          << std::accumulate(branches     .begin(), branches     .end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm){ return s+bhm->size(); })
+		          << std::accumulate(branches.begin(), branches.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> &bhm) { return s + bhm->size(); })
 		          << " in " << branches.size() << " branched chains." << std::endl;
 		std::cout << std::string(2*indent, ' ')
-		          << std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> & bhm){ return s+bhm->size(); })
+		          << std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> &bhm) { return s + bhm->size(); })
 		          << " in " << orphan_chains.size() << " orphan chains." << std::endl;
 	}
 };
