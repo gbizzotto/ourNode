@@ -18,28 +18,22 @@ std::uint32_t calculate_checksum(unsigned char * data, size_t len)
 	return hash.hash_hash;
 }
 
-bool recv_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::mutable_buffer buffer, std::chrono::seconds timeout)
+bool recv_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::mutable_buffer buffer, std::chrono::seconds timeout, const bool & go_on)
 {
 	boost::fibers::promise<bool> promise;
 	boost::fibers::future<bool> future(promise.get_future());
 
-		//utttil::LogWithPrefix log("recv_bytes");
-		//log.add(std::cout);
-
-	//int x = rand();
-	//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " async_read " << x << std::endl;
 	boost::asio::async_read(socket, buffer, 
-		[/*&log,&x,*/promise=std::move(promise)](const boost::system::error_code& ec, std::size_t bytes_transferred) mutable {
-			//log << utttil::LogLevel::INFO << boost::this_fiber::get_id() << " async_read done " << x << std::endl;
+		[promise=std::move(promise)](const boost::system::error_code& ec, std::size_t bytes_transferred) mutable {
 			promise.set_value(!ec);
 		});
-	if (future.wait_for(timeout) != boost::fibers::future_status::ready) {
-		socket.cancel();
-		return false;
-	}
-	return future.get();
+	for (auto deadline=std::chrono::system_clock::now()+timeout ; go_on && std::chrono::system_clock::now()<deadline ; )
+		if (future.wait_for(std::chrono::milliseconds(100)) == boost::fibers::future_status::ready)
+			return future.get();
+	socket.cancel();
+	return false;
 }
-bool send_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::const_buffer buffer, std::chrono::seconds timeout)
+bool send_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::const_buffer buffer, std::chrono::seconds timeout, const bool & go_on)
 {
 	boost::fibers::promise<bool> promise;
 	boost::fibers::future<bool> future(promise.get_future());
@@ -48,10 +42,10 @@ bool send_bytes(boost::asio::ip::tcp::socket & socket, boost::asio::const_buffer
 	socket.async_send(buffer, [promise=std::move(promise)](const boost::system::error_code & ec, std::size_t bytes_transferred) mutable {
 			promise.set_value(!ec);
 		});
-	if (future.wait_for(timeout) != boost::fibers::future_status::ready) {
-		return false;
-	}
-	return future.get();
+	for (auto deadline=std::chrono::system_clock::now()+timeout ; go_on && std::chrono::system_clock::now()<deadline ; )
+		if (future.wait_for(std::chrono::milliseconds(100)) == boost::fibers::future_status::ready)
+			return future.get();
+	return false;
 }
 
 
@@ -149,7 +143,7 @@ transaction consume_tx(std::string_view & data)
 
 	tx.has_witness = false;
 	if (data.data()[0] == 0) {
-		std::cout << "has witness" << std::endl;
+		//std::cout << "has witness" << std::endl;
 		tx.has_witness = true;
 		data.remove_prefix(2);
 	}

@@ -134,11 +134,15 @@ struct block_hash_map
 
 	static inline Hash256 no_hash;
 
+	utttil::LogWithPrefix log;
+
 	block_hash_map()
 		: bits(0xFF) // start with any 2^n-1
 		, index_by_hash_hash((bits+1)*2, no_height)
+		, log("block_hash_map")
 	{
 		no_hash.zero();
+		log.add(std::cout);
 	}
 
 	void load(std::filesystem::path p)
@@ -167,7 +171,7 @@ struct block_hash_map
 				file_number = handle.file_number;
 			}
 			fin.close();
-			std::cout << "Resuming from block height: " << best_height() << ' ' << get_last_known_block_hash() << std::endl;
+			log << utttil::LogLevel::INFO << "Resuming from block height: " << best_height() << ' ' << get_last_known_block_hash() << std::endl;
 		}
 		foutindex.open(index_path, std::ios_base::app | std::ios_base::binary);
 		foutdata.open(folder / std::to_string(file_number), std::ios_base::app | std::ios_base::binary);
@@ -216,7 +220,7 @@ struct block_hash_map
 			handle.offset      = 0;
 		} else {
 			std::filesystem::path file_path = folder / std::to_string(file_number);
-			auto file_size = std::filesystem::file_size(file_path);
+			auto file_size = foutdata.tellp();
 			if (file_size > 4'000'000'000ull) {
 				file_number++;
 				handle.file_number = file_number;
@@ -231,8 +235,7 @@ struct block_hash_map
 	}
 	void write_index(block_handle & handle)
 	{
-		auto index_path = folder / "index";
-		serialize_bytes(foutindex, (char*)handle.hash.h, 32);
+		serialize_bytes        (foutindex, (char*)handle.hash.h, 32);
 		serialize_little_endian(foutindex, handle.file_number);
 		serialize_little_endian(foutindex, handle.offset);
 	}
@@ -346,6 +349,14 @@ struct blockchain
 
 	Hash256 parent_block_hash;
 
+	utttil::LogWithPrefix log;
+
+	blockchain()
+		: log(utttil::LogWithPrefix("blockchain"))
+	{
+		log.add(std::cout);
+	}
+
 	void load(std::filesystem::path folder)
 	{
 		root_chain.load(folder);
@@ -353,7 +364,7 @@ struct blockchain
 	template <typename F>
 	void get_raw_block_headers(F callback) const
 	{
-		root_chain.get_raw_block_headers(callback);
+		root_chain.get_raw_block_headers(callback); 
 	}
 
 	const Hash256 & get_last_known_block_hash() const { return root_chain.get_last_known_block_hash(); }
@@ -376,7 +387,11 @@ struct blockchain
 			if (orphan->parent_block_hash == bhm.get_last_known_block_hash())
 			{
 				if ( ! orphan->orphan_chains.empty())
-					std::cout << "orphan shouldn't have orphans" << std::endl;
+					log << utttil::LogLevel::ERROR << "orphan shouldn't have orphans" << std::endl;
+				//log << utttil::LogLevel::INFO << "bhm.merge_nocheck(std::move(orphan->root_chain));" << std::endl;
+				//log << utttil::LogLevel::INFO << "orphan's parent: " << orphan->parent_block_hash << std::endl;
+				//log << utttil::LogLevel::INFO << "orphan's first hash: " << orphan->root_chain.by_height_nocheck(0).hash << std::endl;
+				//log << utttil::LogLevel::INFO << "bhm's last hash: " << bhm.get_last_known_block_hash() << std::endl;
 				bhm.merge_nocheck(std::move(orphan->root_chain));
 				for (auto & branch : orphan->branches)
 					branches.push_back(std::move(branch));
@@ -394,6 +409,7 @@ struct blockchain
 		if (root_chain.size() == 0) {
 			if (hash == testnet_genesis_block_hash || is_orphan) {
 				this->parent_block_hash = prev_block_hash;
+				//log << utttil::LogLevel::INFO << "size 0 root_chain.add_nocheck(block_data, hash);" << std::endl;
 				root_chain.add_nocheck(block_data, hash);
 				check_vs_orphans(root_chain);
 				return;
@@ -401,7 +417,7 @@ struct blockchain
 		}
 		// check root chain tip
 		if (root_chain.get_last_known_block_hash() == prev_block_hash) {
-			//std::cout << "Added to root chain" << std::endl;
+			//log << utttil::LogLevel::INFO << "root_chain.add_nocheck(block_data, hash);" << std::endl;
 			root_chain.add_nocheck(block_data, hash);
 			check_vs_orphans(root_chain);
 			return;

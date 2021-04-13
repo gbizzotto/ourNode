@@ -4,10 +4,17 @@
 #include <deque>
 #include <thread>
 #include <chrono>
+
+#define _GNU_SOURCE
+#include <boost/stacktrace.hpp>
+#include <boost/exception/all.hpp>
+typedef boost::error_info<struct tag_stacktrace, boost::stacktrace::stacktrace> traced;
+
 #include "log.hpp"
 #include "synchronized.hpp"
 #include "blockchain.hpp"
 #include "block_parsing.hpp"
+
 
 namespace ournode
 {
@@ -29,58 +36,106 @@ struct block_verifier
 	{}
 	~block_verifier()
 	{
-		stop();
+		if (go_on)
+		{
+			stop_signal();
+			join();
+		}
 	}
 	void join()
 	{
-		t.join();
+		if (t.joinable())
+			t.join();
 	}
-	void stop()
+	void stop_signal()
 	{
 		go_on = false;
-		join();
+		candidates.notify_all();
 	}
 	void start()
 	{
-		t = std::thread([&](){ this->run(); });
+		t = std::thread([&]()
+			{
+				TRACE
+				try {
+					run();
+				} catch (const std::exception & e) {
+					log << utttil::LogLevel::INFO << "peer::run() threw: " << e.what() << std::endl;
+					const boost::stacktrace::stacktrace* st = boost::get_error_info<traced>(e);
+					if (st) {
+						std::cerr << *st << '\n';
+					}
+					PRINT_TRACE
+				} catch(...) {
+					PRINT_TRACE
+				}
+			});
 	}
 	void run()
 	{
-		log << utttil::LogLevel::INFO << "run" << std::endl;
-		for (;go_on;std::this_thread::sleep_for(std::chrono::milliseconds(1)))
-			while(go_on)
-			{
-				block_handle handle;
+		TRACE
+		try {
+			log << utttil::LogLevel::INFO << "run" << std::endl;
+			for (;go_on;std::this_thread::sleep_for(std::chrono::milliseconds(1)))
+				while(go_on)
 				{
-					auto candidates_proxy = candidates.wait_for_notification([](std::deque<block_handle> & candidates){ return ! candidates.empty(); });
-					handle = std::move(candidates_proxy->front());
-					candidates_proxy->pop_front();
+					block_handle handle;
+					{
+						auto candidates_proxy = candidates.wait_for_notification([&](std::deque<block_handle> & candidates){ return ! candidates.empty() || ! go_on; });
+						if ( ! go_on)
+							return;
+						handle = std::move(candidates_proxy->front());
+						candidates_proxy->pop_front();
+					}
+					if ( ! verify_candidade(handle))
+						rejects->emplace_back(std::move(handle));
 				}
-				if ( ! verify_candidade(handle))
-					rejects->emplace_back(std::move(handle));
-			}
+		} catch(...) {
+			PRINT_TRACE
+		}
+	}
+
+	size_t candidates_count() const { return candidates->size(); }
+	size_t   rejected_count() const { return    rejects->size(); }
+	auto get_rejected_blocks_proxy() { return rejects.lock(); }
+
+	bool verify_merkle_root(const block & bl, std::vector<Hash256> && txids)
+	{
+		TRACE
+
+		Hash256 merkle_root;
+		fill_merkle_root(merkle_root, std::move(txids));
+		if (bl.merkle_root != merkle_root)
+		{
+			log << utttil::LogLevel::INFO
+				<< "Invalid merkle root: " << std::endl
+				<< "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
+				<< "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
+			return false;
+		}
+		return true;
 	}
 
 	void add_candidate(std::string_view block_data, const Hash256 & hash)
 	{
+		TRACE
+
 		block_handle result;
 		result.hash = hash;
-		result.block_data = block_data;
 		result.file_number = 0;
 		result.offset      = 0;
+		result.block_data  = std::move(block_data);
 		candidates->push_back(std::move(result));
 		candidates.notify_one();
 	}
 
 	bool verify_candidade(block_handle & handle)
 	{
+		TRACE
+
 		std::string_view data(handle.block_data.data(), handle.block_data.size());
 
 		try { // parsing might throw
-			// std::string block_hash = dbl_sha256({data.data(), 80});
-			// std::reverse(block_hash.begin(), block_hash.end());
-			// pxln(block_hash.data(), 32);
-
 			block bl;
 			Hash256 hash;
 			std::tie(bl, hash) = consume_header(data, false);
@@ -94,33 +149,22 @@ struct block_verifier
 				bl.txs.push_back(consume_tx(data));
 				const char * tx_end = data.data();
 				std::string_view tx_sv((char*)tx_begin, std::distance(tx_begin, tx_end));
-				//pxln(tx_sv);
 				txids.emplace_back();
 				fill_dbl_sha256(txids.back(), tx_sv);
-				//std::cout << std::hex << txids.back() << std::dec << std::endl;
 			}
 
-			Hash256 merkle_root;
-			fill_merkle_root(merkle_root, std::move(txids));
-			if (bl.merkle_root != merkle_root) {
-				log << utttil::LogLevel::INFO
-				    << "Invalid merkle root: " << std::endl
-				    << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
-				    << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
+			if ( ! verify_merkle_root(bl, std::move(txids)))
 				return false;
-			}
-
-			//std::cout << "ntx: " << ntx << std::endl;
-			//if (ntx > 1)
-			//	for (int i=0 ; i<ntx ; i++)
-			//		std::cout << "tx " << i << std::endl
-			//				<< bl.txs[i] << std::endl;
 
 			bc->add(std::string_view(handle.block_data.data(), handle.block_data.size()), hash, bl.prev_block_hash);
 			return true;
 
 		} catch (std::exception & e) {
 			log << utttil::LogLevel::INFO << "exc: " << e.what() << std::endl;
+			PRINT_TRACE
+			return false;
+		} catch (...) {
+			PRINT_TRACE
 			return false;
 		}
 		log << utttil::LogLevel::INFO << "no idea" << std::endl;

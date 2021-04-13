@@ -16,8 +16,8 @@ class synchronized_proxy
 private:
 	synchronized_proxy() = delete;
 	synchronized_proxy(const synchronized_proxy &) = delete;
-	synchronized_proxy & operator=(const synchronized_proxy &) = delete;
-	synchronized_proxy & operator=(synchronized_proxy &&) = delete;
+	synchronized_proxy & operator=(const synchronized_proxy  &) = delete;
+	synchronized_proxy & operator=(      synchronized_proxy &&) = delete;
 	
 	synchronized_proxy(Mutex & m, T & obj)
 		:lock(m)
@@ -49,6 +49,38 @@ private:
 	T * t;
 };
 
+template<typename T, class Mutex>
+class const_synchronized_proxy
+{
+	template<typename X, class Y, class Z>
+	friend class synchronized;
+
+private:
+	const_synchronized_proxy() = delete;
+	const_synchronized_proxy(const const_synchronized_proxy &) = delete;
+	const_synchronized_proxy & operator=(const const_synchronized_proxy  &) = delete;
+	const_synchronized_proxy & operator=(      const_synchronized_proxy &&) = delete;
+	
+	const_synchronized_proxy(Mutex & m, const T & obj)
+		:lock(m)
+		,t(&obj)
+	{}
+	const_synchronized_proxy(Mutex & m, const T & obj, int)
+		:lock(m, std::try_to_lock)
+		,t((lock)?&obj:nullptr)
+	{}
+
+public:
+	bool operator!() { return !lock; }
+
+	const T * operator->() const { return  t; }
+	const T & operator* () const { return *t; }
+
+private:
+	std::unique_lock<Mutex> lock;
+	const T * const t;
+};
+
 
 template<typename T, class Mutex=std::mutex, class CV=std::condition_variable>
 class synchronized
@@ -56,7 +88,8 @@ class synchronized
 public:
 	// Convenience typefed for subclasses to use
 	using value_type = T;
-	using proxy_type = synchronized_proxy<T,Mutex>;
+	using const_proxy_type = const_synchronized_proxy<T,Mutex>;
+	using       proxy_type =       synchronized_proxy<T,Mutex>;
 	
 	synchronized() = default;
 	synchronized(const T  & t) : t(          t ) {}
@@ -72,12 +105,10 @@ public:
 	proxy_type     lock() { return proxy_type(mutex, t   ); }
 	proxy_type try_lock() { return proxy_type(mutex, t, 0); }
 
-	proxy_type operator->() {
-		return proxy_type(mutex, t);
-	}
-	proxy_type operator*() {
-		return proxy_type(mutex, t);
-	}
+	const const_proxy_type operator->() const { return const_proxy_type(mutex, t); }
+	            proxy_type operator->()       { return proxy_type(mutex, t); }
+	const const_proxy_type operator*() const { return const_proxy_type(mutex, t); }
+	            proxy_type operator*()       { return proxy_type(mutex, t); }
 
 	template<typename Check>
 	proxy_type wait_for_notification(Check check)
@@ -98,8 +129,8 @@ public:
 
 protected:
 	T t;
-	Mutex mutex;
-	CV cv;
+	mutable Mutex mutex;
+	mutable CV cv;
 	size_t cv_counter = 0;
 };
 

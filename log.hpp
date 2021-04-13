@@ -4,8 +4,11 @@
 #include <iostream>
 #include <vector>
 #include <mutex>
+#include <thread>
+#include <boost/fiber/all.hpp>
 
 #include "timestamp.hpp"
+#include "on_scope_exit.hpp"
 
 namespace utttil {
 
@@ -66,6 +69,7 @@ std::unique_ptr<Log<S>> operator<<(std::unique_ptr<Log<S>> log, std::ostream& (*
 
 enum class LogLevel
 {
+	DEBUG,
 	INFO,
 	WARNING,
 	ERROR,
@@ -74,6 +78,7 @@ enum class LogLevel
 };
 static inline const char * LogLevelNames[] =
 {
+	"DEBUG",
 	"INFO",
 	"WARNING",
 	"ERROR",
@@ -87,6 +92,7 @@ struct LogWithPrefix_
 	std::string prefix;
 	LogLevel level;
 	std::vector<std::ostream*> outs;
+	std::vector<std::string> funcs;
 
 	static inline std::recursive_mutex cout_mutex;
 
@@ -106,6 +112,12 @@ struct LogWithPrefix_
 		for (auto & out : outs)
 			out->flush();
 	}
+	void enter(std::string func) { funcs.emplace_back(std::move(func)); }
+	void exit() { funcs.pop_back(); }
+	std::string trace_stack_string() const
+	{
+		return std::accumulate(funcs.rbegin(), funcs.rend(), std::string("Stack:"), [](std::string & s, const std::string & elm) -> std::string & { return s.append("\n  ").append(elm); });
+	}
 };
 template<size_t S=0>
 std::unique_ptr<Log<S>> operator<<(LogWithPrefix_<S> & log, LogLevel level)
@@ -114,5 +126,22 @@ std::unique_ptr<Log<S>> operator<<(LogWithPrefix_<S> & log, LogLevel level)
 }
 
 using LogWithPrefix = LogWithPrefix_<0>;
+
+LogWithPrefix & logger()
+{
+	thread_local std::map<boost::fibers::fiber::id, LogWithPrefix> logs;
+	auto p = logs.insert({boost::this_fiber::get_id(), {}});
+	return p.first->second;
+}
+
+std::unique_ptr<Log<0>> info()
+{
+	return logger() << LogLevel::INFO;
+}
+
+#define TRACE utttil::logger().enter(__func__); \
+	ON_SCOPE_GRACEFULLY_EXIT([](){utttil::logger().exit();});
+
+#define PRINT_TRACE	std::cout << utttil::logger().trace_stack_string() << std::endl;
 
 } // namespace
