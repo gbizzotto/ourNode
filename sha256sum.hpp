@@ -186,6 +186,18 @@ Hash256 operator "" _bigendian_sha256(const char * literal)
 	return result;
 }
 
+bool operator<(const Hash256 & left, const Hash256 & right)
+{
+	for (int i=31 ; i>0 ; i--)
+	{
+		if (left.h[i] < right.h[i])
+			return true;
+		else if (left.h[i] > right.h[i])
+			return false;
+	}
+	return false;
+}
+
 template<typename O>
 O & operator<<(O & out, const Hash256 & hash)
 {

@@ -53,7 +53,7 @@ int main()
 		
 		utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> bc;
 		bc->load("./testnet"); // select different folders for testnet3/mainnet
-		check_integrity(bc);
+		//check_integrity(bc);
 
 		ournode::block_verifier verifier(bc);
 		verifier.start();

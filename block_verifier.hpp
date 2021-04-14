@@ -19,6 +19,24 @@ typedef boost::error_info<struct tag_stacktrace, boost::stacktrace::stacktrace> 
 namespace ournode
 {
 
+Hash256 calculate_target(std::uint32_t difficulty)
+{
+	Hash256 result;
+	result.zero();
+
+	int exp = difficulty >> 24;
+	int shift = 8 * (exp-3);
+	std::uint32_t mantissa = difficulty & 0x00FFFFFF;
+	mantissa <<= shift % 8;
+	int offset = shift >> 3;
+
+	result.h[offset  ] =  mantissa        & 0xFF;
+	result.h[offset+1] = (mantissa >>  8) & 0xFF;
+	result.h[offset+2] = (mantissa >> 16) & 0xFF;
+
+	return result;
+}
+
 struct block_verifier
 {
 	utttil::synchronized<std::deque<block_handle>> candidates;
@@ -33,7 +51,9 @@ struct block_verifier
 	block_verifier(utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_)
 		: bc(bc_)
 		, log("verifier")
-	{}
+	{
+		log.add(std::cout);
+	}
 	~block_verifier()
 	{
 		if (go_on)
@@ -107,10 +127,10 @@ struct block_verifier
 		fill_merkle_root(merkle_root, std::move(txids));
 		if (bl.merkle_root != merkle_root)
 		{
-			log << utttil::LogLevel::INFO
-				<< "Invalid merkle root: " << std::endl
-				<< "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
-				<< "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
+			//log << utttil::LogLevel::INFO
+			//    << "Invalid merkle root: " << std::endl
+			//    << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
+			//    << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
 			return false;
 		}
 		return true;
@@ -137,9 +157,19 @@ struct block_verifier
 
 		try { // parsing might throw
 			block bl;
-			Hash256 hash;
-			std::tie(bl, hash) = consume_header(data, false);
+			std::tie(bl, handle.hash) = consume_header(data, false);
 
+			// check hash vs difficulty
+			if (calculate_target(bl.difficulty) < handle.hash)
+			{
+				//log << utttil::LogLevel::INFO
+				//    << "Difficulty doens't match: "
+				//    << calculate_target(bl.difficulty) << " < " << handle.hash
+				//    << std::endl;
+				return false;
+			}
+
+			// check merkle root
 			auto ntx = consume_var_int(data);
 			std::vector<Hash256> txids;
 			txids.reserve(ntx);
@@ -152,22 +182,21 @@ struct block_verifier
 				txids.emplace_back();
 				fill_dbl_sha256(txids.back(), tx_sv);
 			}
-
 			if ( ! verify_merkle_root(bl, std::move(txids)))
 				return false;
 
-			bc->add(std::string_view(handle.block_data.data(), handle.block_data.size()), hash, bl.prev_block_hash);
+			bc->add(std::string_view(handle.block_data.data(), handle.block_data.size()), handle.hash, bl.prev_block_hash);
 			return true;
 
 		} catch (std::exception & e) {
-			log << utttil::LogLevel::INFO << "exc: " << e.what() << std::endl;
+			log << utttil::LogLevel::ERROR << "exc: " << e.what() << std::endl;
 			PRINT_TRACE
 			return false;
 		} catch (...) {
 			PRINT_TRACE
 			return false;
 		}
-		log << utttil::LogLevel::INFO << "no idea" << std::endl;
+		log << utttil::LogLevel::ERROR << "no idea" << std::endl;
 		return false;
 	}
 };
