@@ -216,11 +216,12 @@ struct peer : std::enable_shared_from_this<peer<network>>
 	{
 		status = Opening;
 		boost::fibers::fiber([self=this->shared_from_this()](){
+				utttil::fiber_local_logger("peer");
 				TRACE
 				try {
 					self->run();
 				} catch (const std::exception & e) {
-					self->net.log << utttil::LogLevel::INFO << "peer::run() threw: " << e.what() << std::endl;
+					utttil::error() << "peer::run() threw: " << e.what() << std::endl;
 					const boost::stacktrace::stacktrace* st = boost::get_error_info<traced>(e);
 					if (st) {
 						std::cerr << *st << '\n';
@@ -237,12 +238,12 @@ struct peer : std::enable_shared_from_this<peer<network>>
 	void run()
 	{
 		TRACE
-		//std::cout << "Trying " << my_peer_config << std::endl;
+		//utttil::debug() << "Trying " << my_peer_config << std::endl;
 		if ( !connect()) {
 			return;
 		}
 
-		//std::cout << "Socket opened with " << my_peer_config << std::endl;
+		//utttil::debug() << "Socket opened with " << my_peer_config << std::endl;
 
 		// handshake
 		boost::fibers::fiber(boost::fibers::launch::dispatch,
@@ -267,7 +268,7 @@ struct peer : std::enable_shared_from_this<peer<network>>
 					self->quality = peer_config::Quality::Good;
 					self->status = Handshaken;
 				} catch (const std::exception & e) {
-					self->net.log << utttil::LogLevel::INFO << "peer handshake threw: " << e.what() << std::endl;
+					utttil::info() << "peer handshake threw: " << e.what() << std::endl;
 					const boost::stacktrace::stacktrace* st = boost::get_error_info<traced>(e);
 					if (st) {
 						std::cerr << *st << '\n';
@@ -783,7 +784,6 @@ struct network
 	boost::fibers::fiber keep_printing_stats_fiber;
 	boost::fibers::fiber keep_saving_conf_fiber;
 
-	utttil::LogWithPrefix log;
 	
 	network(utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> & conf_, utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_, block_verifier & verifier_)
 		: io_context(std::make_shared<boost::asio::io_context>())
@@ -791,10 +791,7 @@ struct network
 		, bc(bc_)
 		, my_peer_manager(*this)
 		, verifier(verifier_)
-		, log("network")
-	{
-		log.add(std::cout);
-	}
+	{}
 	~network()
 	{
 		if (go_on)
@@ -817,13 +814,14 @@ struct network
 	{
 		t = std::thread([&]()
 			{
+				utttil::fiber_local_logger("network");
 				try {
 					this->run();
 				} catch (const std::exception & e) {
-					log << utttil::LogLevel::INFO << "network::run() threw: " << e.what() << std::endl;
+					utttil::error() << "network::run() threw: " << e.what() << std::endl;
 					const boost::stacktrace::stacktrace* st = boost::get_error_info<traced>(e);
 					if (st)
-						std::cerr << *st << '\n';
+						utttil::error() << *st << '\n';
 					PRINT_TRACE
 				} catch(...) {
 					TRACE
@@ -831,11 +829,13 @@ struct network
 			});
 	}
 	template<typename F>
-	boost::fibers::fiber create_fiber(F f)
+	boost::fibers::fiber create_fiber(std::string s, F f)
 	{
-		return boost::fibers::fiber([f2=std::move(f)]()
+		return boost::fibers::fiber([&s,f2=std::move(f)]()
 			{
+				utttil::fiber_local_logger(s);
 				TRACE
+				ON_SCOPE_EXIT([&](){ utttil::info() << s << " ends" << std::endl; });
 				try {
 					f2();
 				} catch(...) {
@@ -851,10 +851,10 @@ struct network
 		boost::fibers::use_scheduling_algorithm<boost::fibers::asio::round_robin>(io_context);
 
 		//my_peer_manager.start();
-		keep_well_connected_fiber = create_fiber([this](){ keep_well_connected(); });
-		keep_up_to_date_fiber     = create_fiber([this](){ keep_up_to_date    (); });
-		keep_printing_stats_fiber = create_fiber([this](){ keep_printing_stats(); });
-		keep_saving_conf_fiber    = create_fiber([this](){ keep_saving_conf   (); });
+		keep_well_connected_fiber = create_fiber("keep_well_connected", [this](){ keep_well_connected(); });
+		keep_up_to_date_fiber     = create_fiber("keep_up_to_date"    , [this](){ keep_up_to_date    (); });
+		keep_printing_stats_fiber = create_fiber("keep_printing_stats", [this](){ keep_printing_stats(); });
+		keep_saving_conf_fiber    = create_fiber("keep_saving_conf"   , [this](){ keep_saving_conf   (); });
 
 		boost::this_fiber::sleep_for(std::chrono::seconds(1));
 		io_context->run();
@@ -870,7 +870,6 @@ struct network
 	{
 		TRACE
 
-		ON_SCOPE_EXIT([&](){ log << utttil::LogLevel::INFO << "keep_well_connected fiber ends" << std::endl; });
 		auto min_peer_count = conf->min_peer_count;
 		for ( ; go_on ; boost::this_fiber::sleep_for(std::chrono::seconds(1)))
 		{
@@ -906,7 +905,6 @@ struct network
 	{
 		TRACE
 		
-		ON_SCOPE_EXIT([&](){ log << utttil::LogLevel::INFO << "keep_printing_stats fiber ends" << std::endl; });
 		std::chrono::seconds timeout(1);
 		while(go_on)
 		{
@@ -919,7 +917,6 @@ struct network
 	{
 		TRACE
 		
-		ON_SCOPE_EXIT([&](){ log << utttil::LogLevel::INFO << "keep_saving_conf fiber ends" << std::endl; });
 		std::chrono::seconds timeout(10);
 		while(go_on)
 		{
@@ -932,27 +929,24 @@ struct network
 	void print_stats()
 	{
 		TRACE
-		
-		utttil::LogWithPrefix log("net stats");
-		log.add(std::cout);
 
 		static size_t bytes_sent_then = 0;
 		static size_t bytes_rcvd_then = 0;
 		static auto then = std::chrono::system_clock::now();
 
-		log << utttil::LogLevel::INFO << "Handshaken with " << peers.size()+my_peer_manager.handshaken_peers.size()+my_peer_manager.peers_in_use.size() << std::endl;
+		utttil::debug() << "Handshaken with " << peers.size()+my_peer_manager.handshaken_peers.size()+my_peer_manager.peers_in_use.size() << std::endl;
 		{
 			auto bc_proxy = bc.lock();
-			bc_proxy->print(log, utttil::LogLevel::INFO);
-			log << utttil::LogLevel::INFO << bc_proxy->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
+			bc_proxy->print();
+			utttil::debug() << bc_proxy->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
 		}
-		log << utttil::LogLevel::INFO << verifier.candidates_count() << " queued for verification." << std::endl;
-		log << utttil::LogLevel::INFO << verifier.rejected_count() << " rejected from verification." << std::endl;
+		utttil::debug() << verifier.candidates_count() << " queued for verification." << std::endl;
+		utttil::debug() << verifier.rejected_count() << " rejected from verification." << std::endl;
 		auto now = std::chrono::system_clock::now();
 		auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now-then).count();
 		if (milliseconds != 0) {
-			log << utttil::LogLevel::INFO << "Sending bytes: " << (this->bytes_sent-bytes_sent_then) / milliseconds << " kB/s. : " << 8*(this->bytes_sent-bytes_sent_then) / milliseconds << " kb/s." << std::endl;
-			log << utttil::LogLevel::INFO << "Recving bytes: " << (this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kB/s. : " << 8*(this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kb/s." << std::endl;
+			utttil::debug() << "Sending bytes: " << (this->bytes_sent-bytes_sent_then) / milliseconds << " kB/s. : " << 8*(this->bytes_sent-bytes_sent_then) / milliseconds << " kb/s." << std::endl;
+			utttil::debug() << "Recving bytes: " << (this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kB/s. : " << 8*(this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kb/s." << std::endl;
 		}
 		then = now;
 		bytes_sent_then = this->bytes_sent;
@@ -963,7 +957,6 @@ struct network
 	{
 		TRACE
 		
-		ON_SCOPE_EXIT([&](){ log << utttil::LogLevel::INFO << "keep_up_to_date fiber ends" << std::endl; });
 		// initial sync
 		if (bc->best_height() == blockchain::no_height)
 			missing_blocks.push_back(blockchain::testnet_genesis_block_hash);
@@ -989,13 +982,8 @@ struct network
 	void synchronize_blockchain()
 	{
 		TRACE
-		
-		utttil::LogWithPrefix log("synchronize_blockchain");
-		log.add(std::cout);
 
-		log << utttil::LogLevel::INFO << "Start synching blockchain." << std::endl;
-
-		ON_SCOPE_EXIT([&](){ log << utttil::LogLevel::INFO << "synchronize_blockchain fiber ends" << std::endl; });
+		utttil::info() << "Start synching blockchain." << std::endl;
 
 		auto get_last_known_block_hash = [&]() -> const Hash256 &
 			{
@@ -1012,23 +1000,24 @@ struct network
 
 		auto get_block_hashes_fiber = boost::fibers::fiber(boost::fibers::launch::dispatch, [&]()
 			{
+				utttil::fiber_local_logger("get_block_hashes_fiber");
 				TRACE
 				try {		
-					log << utttil::LogLevel::INFO << "get_block_hashes_fiber fiber starts" << std::endl;
-					ON_SCOPE_EXIT([&](){ log << utttil::LogLevel::INFO << "get_block_hashes_fiber fiber ends" << std::endl; });
+					utttil::info() << "get_block_hashes_fiber fiber starts" << std::endl;
+					ON_SCOPE_EXIT([&](){ utttil::info() << "get_block_hashes_fiber fiber ends" << std::endl; });
 					for (int i=0 ; i<10 && go_on ; i++)
 					{
 						auto p = my_peer_manager.get_peer();
 						if ( ! p)
 							return;
-						log << utttil::LogLevel::INFO << "Got peer get_block_hashes_fiber" << std::endl;
+						utttil::info() << "Got peer get_block_hashes_fiber" << std::endl;
 
 						while (go_on)
 						{
 							get_back_rejected_blocks();
 
 							Hash256 request_hash = get_last_known_block_hash();
-							//log << utttil::LogLevel::INFO << "Requesting blocks after " << request_hash << std::endl;
+							//utttil::info() << "Requesting blocks after " << request_hash << std::endl;
 							p->send_getblocks_msg(request_hash);
 
 							for ( auto timeout=std::chrono::system_clock::now()+std::chrono::seconds(10)
@@ -1045,7 +1034,7 @@ struct network
 						}
 						my_peer_manager.return_peer(p);
 					}
-					log << utttil::LogLevel::MUST_HAVE << "I'm done getting new block hashes." << std::endl;
+					utttil::must_have() << "I'm done getting new block hashes." << std::endl;
 					downloading_block_list = false;
 				} catch(...) {
 					PRINT_TRACE
@@ -1058,10 +1047,11 @@ struct network
 		while (get_blocks_fibers.size() < max_DL_fibers_count && go_on)
 			get_blocks_fibers.emplace_back([&]()
 			{
+				utttil::fiber_local_logger("get_blocks_fibers");
 				TRACE
 				try {
-					//log << utttil::LogLevel::INFO << "get_blocks_fiber fiber starts" << std::endl;
-					//ON_SCOPE_EXIT([&](){ log << utttil::LogLevel::INFO << "get_blocks_fiber fiber ends" << std::endl; });
+					//utttil::info() << "get_blocks_fiber fiber starts" << std::endl;
+					//ON_SCOPE_EXIT([&](){ utttil::info() << "get_blocks_fiber fiber ends" << std::endl; });
 					std::chrono::seconds timeout(20);
 					std::list<Hash256> asked_blocks;
 					auto p = my_peer_manager.get_peer();
@@ -1161,7 +1151,6 @@ struct network
 	{
 		TRACE
 		
-		//log << utttil::LogLevel::INFO << "process_block_msg" << std::endl;
 		block bl;
 		Hash256 hash;
 
@@ -1169,10 +1158,8 @@ struct network
 			std::string_view data(msg.body.data(), msg.body.size());
 			std::tie(bl, hash) = consume_header(data, false);
 			verifier.add_candidate(std::string_view(msg.body.data(), msg.body.size()), hash);
-			//log << utttil::LogLevel::INFO << "OK" << std::endl;
 			return hash;
 		} catch (std::exception & e) {
-			//log << utttil::LogLevel::INFO << "NOK" << std::endl;
 			hash.zero();
 			return hash;
 		}

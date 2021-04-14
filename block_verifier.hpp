@@ -43,17 +43,13 @@ struct block_verifier
 	utttil::synchronized<std::deque<block_handle>> rejects;
 
 	utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc;
-	utttil::LogWithPrefix log;
-
+	
 	bool go_on = true;
 	std::thread t;
 
 	block_verifier(utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_)
 		: bc(bc_)
-		, log("verifier")
-	{
-		log.add(std::cout);
-	}
+	{}
 	~block_verifier()
 	{
 		if (go_on)
@@ -76,11 +72,12 @@ struct block_verifier
 	{
 		t = std::thread([&]()
 			{
+				utttil::fiber_local_logger("verifier");
 				TRACE
 				try {
 					run();
 				} catch (const std::exception & e) {
-					log << utttil::LogLevel::INFO << "peer::run() threw: " << e.what() << std::endl;
+					utttil::error() << "peer::run() threw: " << e.what() << std::endl;
 					const boost::stacktrace::stacktrace* st = boost::get_error_info<traced>(e);
 					if (st) {
 						std::cerr << *st << '\n';
@@ -95,11 +92,11 @@ struct block_verifier
 	{
 		TRACE
 		try {
-			log << utttil::LogLevel::INFO << "run" << std::endl;
 			for (;go_on;std::this_thread::sleep_for(std::chrono::milliseconds(1)))
 				while(go_on)
 				{
 					block_handle handle;
+					block block_to_fill;
 					{
 						auto candidates_proxy = candidates.wait_for_notification([&](std::deque<block_handle> & candidates){ return ! candidates.empty() || ! go_on; });
 						if ( ! go_on)
@@ -107,8 +104,10 @@ struct block_verifier
 						handle = std::move(candidates_proxy->front());
 						candidates_proxy->pop_front();
 					}
-					if ( ! verify_candidade(handle))
+					if ( ! verify_candidade(handle, block_to_fill))
 						rejects->emplace_back(std::move(handle));
+					else
+						bc->add(std::string_view(handle.block_data.data(), handle.block_data.size()), handle.hash, block_to_fill.prev_block_hash);
 				}
 		} catch(...) {
 			PRINT_TRACE
@@ -118,23 +117,6 @@ struct block_verifier
 	size_t candidates_count() const { return candidates->size(); }
 	size_t   rejected_count() const { return    rejects->size(); }
 	auto get_rejected_blocks_proxy() { return rejects.lock(); }
-
-	bool verify_merkle_root(const block & bl, std::vector<Hash256> && txids)
-	{
-		TRACE
-
-		Hash256 merkle_root;
-		fill_merkle_root(merkle_root, std::move(txids));
-		if (bl.merkle_root != merkle_root)
-		{
-			//log << utttil::LogLevel::INFO
-			//    << "Invalid merkle root: " << std::endl
-			//    << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
-			//    << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
-			return false;
-		}
-		return true;
-	}
 
 	void add_candidate(std::string_view block_data, const Hash256 & hash)
 	{
@@ -149,22 +131,38 @@ struct block_verifier
 		candidates.notify_one();
 	}
 
-	bool verify_candidade(block_handle & handle)
+	static bool verify_merkle_root(const block & bl, std::vector<Hash256> && txids)
+	{
+		TRACE
+
+		Hash256 merkle_root;
+		fill_merkle_root(merkle_root, std::move(txids));
+		if (bl.merkle_root != merkle_root)
+		{
+			//utttil::info()
+			//    << "Invalid merkle root: " << std::endl
+			//    << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
+			//    << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
+			return false;
+		}
+		return true;
+	}
+
+	static bool verify_candidade(block_handle & handle, block & block_to_fill)
 	{
 		TRACE
 
 		std::string_view data(handle.block_data.data(), handle.block_data.size());
 
 		try { // parsing might throw
-			block bl;
-			std::tie(bl, handle.hash) = consume_header(data, false);
+			std::tie(block_to_fill, handle.hash) = consume_header(data, false);
 
 			// check hash vs target
-			if (calculate_target(bl.bits) < handle.hash)
+			if (calculate_target(block_to_fill.bits) < handle.hash)
 			{
-				//log << utttil::LogLevel::INFO
+				//utttil::info()
 				//    << "Difficulty doens't match: "
-				//    << calculate_target(bl.bits) << " < " << handle.hash
+				//    << calculate_target(block_to_fill.bits) << " < " << handle.hash
 				//    << std::endl;
 				return false;
 			}
@@ -176,27 +174,26 @@ struct block_verifier
 			for (int i=0 ; i<ntx ; i++)
 			{
 				const char * tx_begin = data.data();
-				bl.txs.push_back(consume_tx(data));
+				block_to_fill.txs.push_back(consume_tx(data));
 				const char * tx_end = data.data();
 				std::string_view tx_sv((char*)tx_begin, std::distance(tx_begin, tx_end));
 				txids.emplace_back();
 				fill_dbl_sha256(txids.back(), tx_sv);
 			}
-			if ( ! verify_merkle_root(bl, std::move(txids)))
+			if ( ! verify_merkle_root(block_to_fill, std::move(txids)))
 				return false;
 
-			bc->add(std::string_view(handle.block_data.data(), handle.block_data.size()), handle.hash, bl.prev_block_hash);
 			return true;
 
 		} catch (std::exception & e) {
-			log << utttil::LogLevel::ERROR << "exc: " << e.what() << std::endl;
+			utttil::error() << "exc: " << e.what() << std::endl;
 			PRINT_TRACE
 			return false;
 		} catch (...) {
 			PRINT_TRACE
 			return false;
 		}
-		log << utttil::LogLevel::ERROR << "no idea" << std::endl;
+		utttil::warning() << "no idea" << std::endl;
 		return false;
 	}
 };

@@ -5,6 +5,7 @@
 #include <vector>
 #include <mutex>
 #include <thread>
+#include <initializer_list>
 #include <boost/fiber/all.hpp>
 
 #include "timestamp.hpp"
@@ -100,6 +101,11 @@ struct LogWithPrefix_
 		: prefix(std::move(prefix))
 		, level(LogLevel::INFO)
 	{}
+	LogWithPrefix_(std::string prefix, LogWithPrefix_ & other)
+		: prefix(std::move(prefix))
+		, level(other.level)
+		, outs(other.outs)
+	{}
 
 	void set_prefix(std::string p) { prefix = std::move(p); }
 	void set_level(LogLevel l) { level = l; }
@@ -116,7 +122,7 @@ struct LogWithPrefix_
 	void exit() { funcs.pop_back(); }
 	std::string trace_stack_string() const
 	{
-		return std::accumulate(funcs.rbegin(), funcs.rend(), std::string("Stack:"), [](std::string & s, const std::string & elm) -> std::string & { return s.append("\n  ").append(elm); });
+		return std::accumulate(funcs.rbegin(), funcs.rend(), std::string(prefix).append(" stack:"), [](std::string & s, const std::string & elm) -> std::string & { return s.append("\n  ").append(elm); });
 	}
 };
 template<size_t S=0>
@@ -127,21 +133,38 @@ std::unique_ptr<Log<S>> operator<<(LogWithPrefix_<S> & log, LogLevel level)
 
 using LogWithPrefix = LogWithPrefix_<0>;
 
-LogWithPrefix & logger()
+
+
+LogWithPrefix & default_logger()
+{
+	static LogWithPrefix log("");
+	return log;
+}
+template<typename... Args>
+LogWithPrefix & default_logger(std::ostream & o, Args... args)
+{
+	LogWithPrefix & df = default_logger();
+	df.add(o);
+	return default_logger(args...);
+}
+
+LogWithPrefix & fiber_local_logger(std::string prefix = "")
 {
 	thread_local std::map<boost::fibers::fiber::id, LogWithPrefix> logs;
-	auto p = logs.insert({boost::this_fiber::get_id(), {}});
+	auto p = logs.insert({boost::this_fiber::get_id(), {prefix, default_logger()}});
 	return p.first->second;
 }
 
-std::unique_ptr<Log<0>> info()
-{
-	return logger() << LogLevel::INFO;
-}
+std::unique_ptr<Log<0>>     debug() { return fiber_local_logger() << LogLevel::DEBUG    ; }
+std::unique_ptr<Log<0>>      info() { return fiber_local_logger("a") << LogLevel::INFO     ; }
+std::unique_ptr<Log<0>>   warning() { return fiber_local_logger() << LogLevel::WARNING  ; }
+std::unique_ptr<Log<0>>     error() { return fiber_local_logger() << LogLevel::ERROR    ; }
+std::unique_ptr<Log<0>>     fatal() { return fiber_local_logger() << LogLevel::FATAL    ; }
+std::unique_ptr<Log<0>> must_have() { return fiber_local_logger() << LogLevel::MUST_HAVE; }
 
-#define TRACE utttil::logger().enter(__func__); \
-	ON_SCOPE_GRACEFULLY_EXIT([](){utttil::logger().exit();});
+#define TRACE utttil::fiber_local_logger().enter(__func__); \
+	ON_SCOPE_GRACEFULLY_EXIT([](){utttil::fiber_local_logger().exit();});
 
-#define PRINT_TRACE	std::cout << utttil::logger().trace_stack_string() << std::endl;
+#define PRINT_TRACE	std::cout << utttil::fiber_local_logger().trace_stack_string() << std::endl;
 
 } // namespace

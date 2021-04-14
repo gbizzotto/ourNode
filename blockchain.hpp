@@ -134,15 +134,11 @@ struct block_hash_map
 
 	static inline Hash256 no_hash;
 
-	utttil::LogWithPrefix log;
-
 	block_hash_map()
 		: bits(0xFF) // start with any 2^n-1
 		, index_by_hash_hash((bits+1)*2, no_height)
-		, log("block_hash_map")
 	{
 		no_hash.zero();
-		log.add(std::cout);
 	}
 
 	void load(std::filesystem::path p)
@@ -171,7 +167,7 @@ struct block_hash_map
 				file_number = handle.file_number;
 			}
 			fin.close();
-			log << utttil::LogLevel::INFO << "Resuming from block height: " << best_height() << ' ' << get_last_known_block_hash() << std::endl;
+			utttil::info() << "Resuming from block height: " << best_height() << ' ' << get_last_known_block_hash() << std::endl;
 		}
 		foutindex.open(index_path, std::ios_base::app | std::ios_base::binary);
 		foutdata.open(folder / std::to_string(file_number), std::ios_base::app | std::ios_base::binary);
@@ -349,14 +345,6 @@ struct blockchain
 
 	Hash256 parent_block_hash;
 
-	utttil::LogWithPrefix log;
-
-	blockchain()
-		: log(utttil::LogWithPrefix("blockchain"))
-	{
-		log.add(std::cout);
-	}
-
 	void load(std::filesystem::path folder)
 	{
 		root_chain.load(folder);
@@ -387,11 +375,11 @@ struct blockchain
 			if (orphan->parent_block_hash == bhm.get_last_known_block_hash())
 			{
 				if ( ! orphan->orphan_chains.empty())
-					log << utttil::LogLevel::ERROR << "orphan shouldn't have orphans" << std::endl;
-				//log << utttil::LogLevel::INFO << "bhm.merge_nocheck(std::move(orphan->root_chain));" << std::endl;
-				//log << utttil::LogLevel::INFO << "orphan's parent: " << orphan->parent_block_hash << std::endl;
-				//log << utttil::LogLevel::INFO << "orphan's first hash: " << orphan->root_chain.by_height_nocheck(0).hash << std::endl;
-				//log << utttil::LogLevel::INFO << "bhm's last hash: " << bhm.get_last_known_block_hash() << std::endl;
+					utttil::error() << "orphan shouldn't have orphans" << std::endl;
+				//utttil::debug() << "bhm.merge_nocheck(std::move(orphan->root_chain));" << std::endl;
+				//utttil::debug() << "orphan's parent: " << orphan->parent_block_hash << std::endl;
+				//utttil::debug() << "orphan's first hash: " << orphan->root_chain.by_height_nocheck(0).hash << std::endl;
+				//utttil::debug() << "bhm's last hash: " << bhm.get_last_known_block_hash() << std::endl;
 				bhm.merge_nocheck(std::move(orphan->root_chain));
 				for (auto & branch : orphan->branches)
 					branches.push_back(std::move(branch));
@@ -405,11 +393,11 @@ struct blockchain
 
 	void add(std::string_view block_data, const Hash256 & hash, const Hash256 & prev_block_hash, bool is_orphan=false)
 	{
-		//std::cout << "root_chain.size(): " << root_chain.size() << std::endl;
+		//utttil::debug() << "root_chain.size(): " << root_chain.size() << std::endl;
 		if (root_chain.size() == 0) {
 			if (hash == testnet_genesis_block_hash || is_orphan) {
 				this->parent_block_hash = prev_block_hash;
-				//log << utttil::LogLevel::INFO << "size 0 root_chain.add_nocheck(block_data, hash);" << std::endl;
+				//utttil::debug() << "size 0 root_chain.add_nocheck(block_data, hash);" << std::endl;
 				root_chain.add_nocheck(block_data, hash);
 				check_vs_orphans(root_chain);
 				return;
@@ -417,7 +405,7 @@ struct blockchain
 		}
 		// check root chain tip
 		if (root_chain.get_last_known_block_hash() == prev_block_hash) {
-			//log << utttil::LogLevel::INFO << "root_chain.add_nocheck(block_data, hash);" << std::endl;
+			//utttil::debug() << "root_chain.add_nocheck(block_data, hash);" << std::endl;
 			root_chain.add_nocheck(block_data, hash);
 			check_vs_orphans(root_chain);
 			return;
@@ -425,21 +413,21 @@ struct blockchain
 		// check branches tips
 		for (auto & branch : branches)
 			if (branch->get_last_known_block_hash() == prev_block_hash) {
-				//std::cout << "Added to an extra tip" << std::endl;
+				//utttil::debug() << "Added to an extra tip" << std::endl;
 				branch->add(block_data, hash, prev_block_hash);
 				return;
 			}
 		// orphan chains tips
 		for (auto & orphan_chain : orphan_chains)
 			if (orphan_chain->get_last_known_block_hash() == prev_block_hash) {
-				//std::cout << "Added to orphan block chain" << std::endl;
+				//utttil::debug() << "Added to orphan block chain" << std::endl;
 				orphan_chain->add(block_data, hash, prev_block_hash);
 				return;
 			}
 
 		// root chain new branch?
 		if (root_chain.height(prev_block_hash) != no_height) {
-			//std::cout << "Added as new extra tip line" << std::endl;
+			//utttil::debug() << "Added as new extra tip line" << std::endl;
 			branches.push_back(std::make_unique<blockchain>());
 			branches.back()->add(block_data, hash, prev_block_hash);
 			return;
@@ -447,19 +435,19 @@ struct blockchain
 		// branch branch?
 		for (auto & branch : branches)
 			if (branch->has(prev_block_hash)) {
-				//std::cout << "Added as new extra branch" << std::endl;
+				//utttil::debug() << "Added as new extra branch" << std::endl;
 				branch->add(block_data, hash, prev_block_hash);
 				return;
 			}
 		// orphan chain new branch?
 		for (auto & orphan : orphan_chains)
 			if (orphan->has(prev_block_hash)) {
-				//std::cout << "Added as new extra branch" << std::endl;
+				//utttil::debug() << "Added as new extra branch" << std::endl;
 				orphan->add(block_data, hash, prev_block_hash);
 				return;
 			}
 
-		//std::cout << "Added as new orphan block line as orphan" << std::endl;
+		//utttil::debug() << "Added as new orphan block line as orphan" << std::endl;
 		auto new_orphan = std::make_unique<blockchain>();
 		new_orphan->add(block_data, hash, prev_block_hash, true);
 		check_vs_orphans(new_orphan->root_chain);
@@ -473,24 +461,24 @@ struct blockchain
 			 ;
 	}
 
-	void print(utttil::LogWithPrefix & log, const utttil::LogLevel & level)
+	void print()
 	{
-		log << level << "root chain " << root_chain.size() << std::endl;
+		utttil::debug() << "root chain " << root_chain.size() << std::endl;
 		//for (auto & block : root_chain.blocks)
-		//	std::cout << std::string(2*indent+2, ' ') << block.prev_block_hash << std::endl;
+		//	utttil::debug() << std::string(2*indent+2, ' ') << block.prev_block_hash << std::endl;
 		//if (root_chain.size() != 0)
-		//	std::cout << std::string(2*indent+2, ' ') << root_chain.get_last_known_block_hash() << std::endl;
+		//	utttil::debug() << std::string(2*indent+2, ' ') << root_chain.get_last_known_block_hash() << std::endl;
 
-		//std::cout << std::string(2*indent, ' ') << "branch chains:" << std::endl;
+		//utttil::debug() << std::string(2*indent, ' ') << "branch chains:" << std::endl;
 		//for (auto & branch : branches)
 		//	branch->print(indent+1);
-		//std::cout << std::string(2*indent, ' ') << "orphan chains:" << std::endl;
+		//utttil::debug() << std::string(2*indent, ' ') << "orphan chains:" << std::endl;
 		//for (auto & orphan : orphan_chains)
 		//	orphan->print(indent+1);
-		log << level
+		utttil::debug()
 		    << std::accumulate(branches.begin(), branches.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> &bhm) { return s + bhm->size(); })
 		    << " in " << branches.size() << " branched chains." << std::endl;
-		log << level
+		utttil::debug()
 		    << std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain> &bhm) { return s + bhm->size(); })
 		    << " in " << orphan_chains.size() << " orphan chains." << std::endl;
 	}

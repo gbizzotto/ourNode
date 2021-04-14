@@ -15,7 +15,7 @@ ournode::block_verifier *g_verifier = nullptr;
 
 void ctrlc_handler(int sig)
 {
-	std::cout << "Shutting down" << std::endl;
+	utttil::must_have() << "Shutting down" << std::endl;
 	g_net->stop_signal();
 	g_verifier->stop_signal();
 }
@@ -32,9 +32,9 @@ void check_integrity(utttil::synchronized<ournode::blockchain, boost::fibers::mu
 			std::tie(b,hash) = ournode::consume_header(sv, false);
 			if (b.prev_block_hash != previous_hash)
 			{
-				std::cout << "Block " << i << " out of order " << hash << std::endl;
-				std::cout << "Block's previous hash " << b.prev_block_hash << std::endl;
-				std::cout << "File's previous hash " << previous_hash << std::endl;
+				utttil::error() << "Block " << i << " out of order " << hash << std::endl;
+				utttil::error() << "Block's previous hash " << b.prev_block_hash << std::endl;
+				utttil::error() << "File's previous hash " << previous_hash << std::endl;
 				return false;
 			}
 			previous_hash = hash;
@@ -46,7 +46,13 @@ void check_integrity(utttil::synchronized<ournode::blockchain, boost::fibers::mu
 
 int main()
 {
+	utttil::default_logger(std::cout);
+
+	utttil::fiber_local_logger("main thread");
+	utttil::must_have() << "Startup" << std::endl;
+
 	TRACE
+	
 	try {
 		utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> conf;
 		conf->load("ournode.conf");
@@ -74,7 +80,7 @@ int main()
 		verifier.join();
 		net.join();
 		conf->save();
-		std::cout << "Stopped gracefully" << std::endl;
+		utttil::must_have() << "Stopped gracefully" << std::endl;
 	} catch(...) {
 		PRINT_TRACE
 	}
