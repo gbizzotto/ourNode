@@ -19,14 +19,14 @@ typedef boost::error_info<struct tag_stacktrace, boost::stacktrace::stacktrace> 
 namespace ournode
 {
 
-Hash256 calculate_target(std::uint32_t difficulty)
+Hash256 calculate_target(std::uint32_t bits)
 {
 	Hash256 result;
 	result.zero();
 
-	int exp = difficulty >> 24;
+	int exp = bits >> 24;
 	int shift = 8 * (exp-3);
-	std::uint32_t mantissa = difficulty & 0x00FFFFFF;
+	std::uint32_t mantissa = bits & 0x00FFFFFF;
 	mantissa <<= shift % 8;
 	int offset = shift >> 3;
 
@@ -159,12 +159,12 @@ struct block_verifier
 			block bl;
 			std::tie(bl, handle.hash) = consume_header(data, false);
 
-			// check hash vs difficulty
-			if (calculate_target(bl.difficulty) < handle.hash)
+			// check hash vs target
+			if (calculate_target(bl.bits) < handle.hash)
 			{
 				//log << utttil::LogLevel::INFO
 				//    << "Difficulty doens't match: "
-				//    << calculate_target(bl.difficulty) << " < " << handle.hash
+				//    << calculate_target(bl.bits) << " < " << handle.hash
 				//    << std::endl;
 				return false;
 			}

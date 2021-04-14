@@ -94,8 +94,8 @@ std::tuple<block,Hash256> consume_header(std::string_view & data, bool consume_n
 	consume_bytes(data, (char*)header.prev_block_hash.h, 32);
 	consume_bytes(data, (char*)header.merkle_root.h, 32);
 	header.timestamp  = consume_little_endian<std::uint32_t>(data);
-	header.difficulty = consume_little_endian<std::uint32_t>(data);
-	header.nonce =  consume_little_endian<std::uint32_t>(data);
+	header.bits       = consume_little_endian<std::uint32_t>(data);
+	header.nonce      = consume_little_endian<std::uint32_t>(data);
 	if (consume_ntx)
 		consume_var_int(data);
 	return {header, hash};

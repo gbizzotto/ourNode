@@ -40,7 +40,7 @@ struct block
 	Hash256 prev_block_hash;
 	Hash256 merkle_root;
 	std::uint32_t timestamp;
-	std::uint32_t difficulty;
+	std::uint32_t bits;
 	std::uint32_t nonce;
 	std::vector<transaction> txs;
 };
