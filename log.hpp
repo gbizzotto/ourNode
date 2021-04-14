@@ -162,7 +162,7 @@ std::unique_ptr<Log<0>>     error() { return fiber_local_logger() << LogLevel::E
 std::unique_ptr<Log<0>>     fatal() { return fiber_local_logger() << LogLevel::FATAL    ; }
 std::unique_ptr<Log<0>> must_have() { return fiber_local_logger() << LogLevel::MUST_HAVE; }
 
-#define TRACE utttil::fiber_local_logger().enter(__func__); \
+#define TRACE utttil::fiber_local_logger().enter(__PRETTY_FUNCTION__); \
 	ON_SCOPE_GRACEFULLY_EXIT([](){utttil::fiber_local_logger().exit();});
 
 #define PRINT_TRACE	std::cout << utttil::fiber_local_logger().trace_stack_string() << std::endl;

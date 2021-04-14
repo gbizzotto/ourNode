@@ -263,6 +263,33 @@ struct block_hash_map
 		}
 	}
 
+	template <typename F>
+	void get_block_handles_preload_data(F callback)
+	{
+		std::ifstream fin;
+		int file_name = -1;
+		for (block_handle & bh : block_handles)
+		{
+			if (file_name != bh.file_number)
+			{
+				auto new_file_name = folder / std::to_string(bh.file_number);
+				if ( ! std::filesystem::exists(new_file_name))
+					return;
+				fin.close();
+				fin.open(new_file_name, std::ios_base::in | std::ios_base::binary);
+				file_name = bh.file_number;
+			}
+			if (fin.eof())
+				return;
+			fin.seekg(bh.offset);
+			auto block_size = consume_little_endian<std::uint32_t>(fin);
+			bh.block_data.resize(block_size);
+			consume_bytes(fin, (char*)bh.block_data.data(), block_size);
+			if ( ! callback(bh))
+				break;
+		}
+	}
+
 	void merge_nocheck(block_hash_map && other)
 	{
 		accomodate_new_size(size() + other.size());
@@ -353,6 +380,11 @@ struct blockchain
 	void get_raw_block_headers(F callback) const
 	{
 		root_chain.get_raw_block_headers(callback); 
+	}
+	template <typename F>
+	void get_block_handles_preload_data(F callback)
+	{
+		root_chain.get_block_handles_preload_data(callback); 
 	}
 
 	const Hash256 & get_last_known_block_hash() const { return root_chain.get_last_known_block_hash(); }

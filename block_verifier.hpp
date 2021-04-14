@@ -139,10 +139,10 @@ struct block_verifier
 		fill_merkle_root(merkle_root, std::move(txids));
 		if (bl.merkle_root != merkle_root)
 		{
-			//utttil::info()
-			//    << "Invalid merkle root: " << std::endl
-			//    << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
-			//    << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
+			utttil::info()
+			    << "Invalid merkle root: " << std::endl
+			    << "Block      merkle root: " << std::hex << bl.merkle_root << std::dec << std::endl
+			    << "Calculated merkle root: " << std::hex <<    merkle_root << std::dec << std::endl;
 			return false;
 		}
 		return true;
@@ -160,10 +160,10 @@ struct block_verifier
 			// check hash vs target
 			if (calculate_target(block_to_fill.bits) < handle.hash)
 			{
-				//utttil::info()
-				//    << "Difficulty doens't match: "
-				//    << calculate_target(block_to_fill.bits) << " < " << handle.hash
-				//    << std::endl;
+				utttil::info()
+				    << "Difficulty doens't match: "
+				    << calculate_target(block_to_fill.bits) << " < " << handle.hash
+				    << std::endl;
 				return false;
 			}
 
