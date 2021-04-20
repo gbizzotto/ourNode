@@ -139,6 +139,8 @@ struct Hash256
 		uint32_t hash_hash;
 		unsigned char h[32];
 	};
+	Hash256() = default;
+	inline Hash256(int) { memset(h, 0, 32); }
 	inline void zero() { memset(h, 0, 32); };
 	bool operator==(const Hash256 & other) const {
 		return memcmp(h, other.h, 32) == 0;
@@ -158,6 +160,10 @@ struct Hash256
 	}
 	std::string_view to_string_view() const {
 		return std::string_view((char*)h, 32);
+	}
+	static inline const Hash256 & zero_hash() {
+		static Hash256 h(0);
+		return h;
 	}
 };
 

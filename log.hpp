@@ -99,7 +99,7 @@ struct LogWithPrefix_
 
 	LogWithPrefix_(std::string prefix = "")
 		: prefix(std::move(prefix))
-		, level(LogLevel::INFO)
+		, level(LogLevel::DEBUG)
 	{}
 	LogWithPrefix_(std::string prefix, LogWithPrefix_ & other)
 		: prefix(std::move(prefix))

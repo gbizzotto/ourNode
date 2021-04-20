@@ -37,17 +37,24 @@ Hash256 calculate_target(std::uint32_t bits)
 	return result;
 }
 
+struct candidate_block
+{
+	std::string raw_data;
+	Hash256 expected_hash;
+};
+
+template<typename Persistence>
 struct block_verifier
 {
-	utttil::synchronized<std::deque<block_handle>> candidates;
-	utttil::synchronized<std::deque<block_handle>> rejects;
+	utttil::synchronized<std::deque<candidate_block>> candidates;
+	utttil::synchronized<std::deque<Hash256>> rejects;
 
-	utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc;
+	utttil::synchronized<ournode::blockchain<Persistence>, boost::fibers::mutex, boost::fibers::condition_variable> & bc;
 	
 	bool go_on = true;
 	std::thread t;
 
-	block_verifier(utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_)
+	block_verifier(utttil::synchronized<ournode::blockchain<Persistence>, boost::fibers::mutex, boost::fibers::condition_variable> & bc_)
 		: bc(bc_)
 	{}
 	~block_verifier()
@@ -95,19 +102,20 @@ struct block_verifier
 			for (;go_on;std::this_thread::sleep_for(std::chrono::milliseconds(1)))
 				while(go_on)
 				{
-					block_handle handle;
-					block block_to_fill;
+					candidate_block candidate;
 					{
-						auto candidates_proxy = candidates.wait_for_notification([&](std::deque<block_handle> & candidates){ return ! candidates.empty() || ! go_on; });
+						auto candidates_proxy = candidates.wait_for_notification([&](std::deque<candidate_block> & candidates){ return ! candidates.empty() || ! go_on; });
 						if ( ! go_on)
 							return;
-						handle = std::move(candidates_proxy->front());
+						candidate = std::move(candidates_proxy->front());
 						candidates_proxy->pop_front();
 					}
-					if ( ! verify_candidade(handle, block_to_fill))
-						rejects->emplace_back(std::move(handle));
+					block block_to_fill;
+					Hash256 hash_to_fill;
+					if ( ! verify(candidate.raw_data, block_to_fill, hash_to_fill))
+						rejects->emplace_back(std::move(candidate.expected_hash));
 					else
-						bc->add(std::string_view(handle.block_data.data(), handle.block_data.size()), handle.hash, block_to_fill.prev_block_hash);
+						bc->add(std::string_view(candidate.raw_data.data(), candidate.raw_data.size()), candidate.expected_hash, block_to_fill.prev_block_hash);
 				}
 		} catch(...) {
 			PRINT_TRACE
@@ -122,12 +130,7 @@ struct block_verifier
 	{
 		TRACE
 
-		block_handle result;
-		result.hash = hash;
-		result.file_number = 0;
-		result.offset      = 0;
-		result.block_data  = std::move(block_data);
-		candidates->push_back(std::move(result));
+		candidates->push_back({std::string(block_data.data(), block_data.size()), hash});
 		candidates.notify_one();
 	}
 
@@ -148,21 +151,21 @@ struct block_verifier
 		return true;
 	}
 
-	static bool verify_candidade(block_handle & handle, block & block_to_fill)
+	static bool verify(std::string & raw_data, block & block_to_fill, Hash256 & hash_to_fill)
 	{
 		TRACE
 
-		std::string_view data(handle.block_data.data(), handle.block_data.size());
+		std::string_view data(raw_data.data(), raw_data.size());
 
 		try { // parsing might throw
-			std::tie(block_to_fill, handle.hash) = consume_header(data, false);
+			std::tie(block_to_fill, hash_to_fill) = consume_header(data, false);
 
 			// check hash vs target
-			if (calculate_target(block_to_fill.bits) < handle.hash)
+			if (calculate_target(block_to_fill.bits) < hash_to_fill)
 			{
 				utttil::info()
 				    << "Difficulty doens't match: "
-				    << calculate_target(block_to_fill.bits) << " < " << handle.hash
+				    << calculate_target(block_to_fill.bits) << " < " << hash_to_fill
 				    << std::endl;
 				return false;
 			}

@@ -238,12 +238,12 @@ struct peer : std::enable_shared_from_this<peer<network>>
 	void run()
 	{
 		TRACE
-		//utttil::debug() << "Trying " << my_peer_config << std::endl;
+		//utttil::info() << "Trying " << my_peer_config << std::endl;
 		if ( !connect()) {
 			return;
 		}
 
-		//utttil::debug() << "Socket opened with " << my_peer_config << std::endl;
+		//utttil::info() << "Socket opened with " << my_peer_config << std::endl;
 
 		// handshake
 		boost::fibers::fiber(boost::fibers::launch::dispatch,
@@ -253,18 +253,18 @@ struct peer : std::enable_shared_from_this<peer<network>>
 					self->send_version_msg();
 					bool rcvd = self->expect_many({"version","verack"}, std::chrono::seconds(20));
 					if ( ! rcvd) {
-						//std::cout << "Coudln't connect to " << self->my_peer_config << std::endl;
+						//utttil::info() << "Coudln't connect to " << self->my_peer_config << std::endl;
 						return;
 					}
-					//std::cout << "Hands shaken with " << self->my_peer_config << std::endl;
+					//utttil::info() << "Hands shaken with " << self->my_peer_config << std::endl;
 					self->send(message("getaddr"));
 					/*message addr;
 					std::tie(rcvd,addr) = self->expect("addr", std::chrono::seconds(10));
 					if ( ! rcvd) {
-						//std::cout << "Didn't receive 'addr' msg from " << self->my_peer_config << std::endl;
+						//utttil::info() << "Didn't receive 'addr' msg from " << self->my_peer_config << std::endl;
 						return;
 					}*/
-					//std::cout << "Fully connected to " << self->my_peer_config << std::endl;
+					//utttil::info() << "Fully connected to " << self->my_peer_config << std::endl;
 					self->quality = peer_config::Quality::Good;
 					self->status = Handshaken;
 				} catch (const std::exception & e) {
@@ -760,9 +760,11 @@ struct peer_manager
 
 struct network
 {
+	using blockchain = ournode::blockchain<file_block_persistence>;
+
 	std::shared_ptr<boost::asio::io_context> io_context;
-	utttil::synchronized<ournode::config    , boost::fibers::mutex, boost::fibers::condition_variable> & conf;
-	utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc;
+	utttil::synchronized<ournode::config                 , boost::fibers::mutex, boost::fibers::condition_variable> & conf;
+	utttil::synchronized<blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc;
 
 	peer_manager<network> my_peer_manager;
 	std::vector<std::shared_ptr<peer<network>>> peers;
@@ -770,7 +772,7 @@ struct network
 	int32_t peer_block_height = 0;
 	std::list<Hash256> missing_blocks;
 
-	block_verifier & verifier;
+	block_verifier<file_block_persistence> & verifier;
 
 	bool go_on;
 	std::thread t;
@@ -785,7 +787,7 @@ struct network
 	boost::fibers::fiber keep_saving_conf_fiber;
 
 	
-	network(utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> & conf_, utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_, block_verifier & verifier_)
+	network(utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> & conf_, utttil::synchronized<blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_, block_verifier<file_block_persistence> & verifier_)
 		: io_context(std::make_shared<boost::asio::io_context>())
 		, conf(conf_)
 		, bc(bc_)
@@ -908,7 +910,7 @@ struct network
 		std::chrono::seconds timeout(1);
 		while(go_on)
 		{
-			for (auto deadline=std::chrono::system_clock::now()+timeout ; go_on && std::chrono::system_clock::now() < deadline; boost::this_fiber::sleep_for(std::chrono::milliseconds(10)))
+			for (auto deadline=std::chrono::system_clock::now()+timeout ; go_on && std::chrono::system_clock::now() < deadline ; boost::this_fiber::sleep_for(std::chrono::milliseconds(10)))
 			{}
 			print_stats();
 		}
@@ -920,7 +922,7 @@ struct network
 		std::chrono::seconds timeout(10);
 		while(go_on)
 		{
-			for (auto deadline=std::chrono::system_clock::now()+timeout ; go_on && std::chrono::system_clock::now() < deadline; boost::this_fiber::sleep_for(std::chrono::milliseconds(10)))
+			for (auto deadline=std::chrono::system_clock::now()+timeout ; go_on && std::chrono::system_clock::now() < deadline ; boost::this_fiber::sleep_for(std::chrono::milliseconds(10)))
 			{}
 			conf->save();
 		}
@@ -934,19 +936,20 @@ struct network
 		static size_t bytes_rcvd_then = 0;
 		static auto then = std::chrono::system_clock::now();
 
-		utttil::debug() << "Handshaken with " << peers.size()+my_peer_manager.handshaken_peers.size()+my_peer_manager.peers_in_use.size() << std::endl;
+		utttil::info() << std::endl;
+		utttil::info() << "Handshaken with " << peers.size()+my_peer_manager.handshaken_peers.size()+my_peer_manager.peers_in_use.size() << std::endl;
 		{
 			auto bc_proxy = bc.lock();
 			bc_proxy->print();
-			utttil::debug() << bc_proxy->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
+			utttil::info() << bc_proxy->size() << " blocks, " << missing_blocks.size() << " to go." << std::endl;
 		}
-		utttil::debug() << verifier.candidates_count() << " queued for verification." << std::endl;
-		utttil::debug() << verifier.rejected_count() << " rejected from verification." << std::endl;
+		utttil::info() << verifier.candidates_count() << " queued for verification." << std::endl;
+		utttil::info() << verifier.rejected_count() << " rejected from verification." << std::endl;
 		auto now = std::chrono::system_clock::now();
 		auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now-then).count();
 		if (milliseconds != 0) {
-			utttil::debug() << "Sending bytes: " << (this->bytes_sent-bytes_sent_then) / milliseconds << " kB/s. : " << 8*(this->bytes_sent-bytes_sent_then) / milliseconds << " kb/s." << std::endl;
-			utttil::debug() << "Recving bytes: " << (this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kB/s. : " << 8*(this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kb/s." << std::endl;
+			utttil::info() << "Sending bytes: " << (this->bytes_sent-bytes_sent_then) / milliseconds << " kB/s. : " << 8*(this->bytes_sent-bytes_sent_then) / milliseconds << " kb/s." << std::endl;
+			utttil::info() << "Recving bytes: " << (this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kB/s. : " << 8*(this->bytes_rcvd-bytes_rcvd_then) / milliseconds << " kb/s." << std::endl;
 		}
 		then = now;
 		bytes_sent_then = this->bytes_sent;
@@ -974,9 +977,9 @@ struct network
 
 	void get_back_rejected_blocks()
 	{
-		auto block_handles = std::move(*verifier.get_rejected_blocks_proxy());
-		for (auto & handle : block_handles)
-			missing_blocks.push_front(handle.hash);
+		auto hashes = std::move(*verifier.get_rejected_blocks_proxy());
+		for (auto & hash : hashes)
+			missing_blocks.push_front(hash);
 	}
 
 	void synchronize_blockchain()
@@ -985,7 +988,7 @@ struct network
 
 		utttil::info() << "Start synching blockchain." << std::endl;
 
-		auto get_last_known_block_hash = [&]() -> const Hash256 &
+		auto get_last_known_block_hash = [&]() -> const Hash256
 			{
 				auto bc_proxy = bc.lock();
 				if ( ! missing_blocks.empty())
@@ -1002,7 +1005,8 @@ struct network
 			{
 				utttil::fiber_local_logger("get_block_hashes_fiber");
 				TRACE
-				try {		
+				try 
+				{		
 					utttil::info() << "get_block_hashes_fiber fiber starts" << std::endl;
 					ON_SCOPE_EXIT([&](){ utttil::info() << "get_block_hashes_fiber fiber ends" << std::endl; });
 					for (int i=0 ; i<10 && go_on ; i++)

@@ -4,14 +4,14 @@
 
 #include "synchronized.hpp"
 
-//#include "trace.hpp"
 #include "config.hpp"
 #include "network.hpp"
 #include "blockchain.hpp"
+#include "block_serialization.hpp"
 #include "block_verifier.hpp"
 
-ournode::network        *g_net      = nullptr;
-ournode::block_verifier *g_verifier = nullptr;
+ournode::network                                         *g_net      = nullptr;
+ournode::block_verifier<ournode::file_block_persistence> *g_verifier = nullptr;
 
 void ctrlc_handler(int sig)
 {
@@ -20,35 +20,40 @@ void ctrlc_handler(int sig)
 	g_verifier->stop_signal();
 }
 
-void check_integrity(utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc)
+template<typename Persistence>
+void check_integrity(utttil::synchronized<ournode::blockchain<Persistence>, boost::fibers::mutex, boost::fibers::condition_variable> & bc)
 {
 	utttil::info() << "Checking integrity of blocks in persistent memory." << std::endl;
 	utttil::info() << "This will take a while." << std::endl;
 
+	std::cout << "hash 0: " << bc->root_chain.persistence.get_hash(0) << std::endl;
+	std::cout << "last known hash: " << bc->get_last_known_block_hash() << std::endl;
+
 	Hash256 previous_hash;
 	previous_hash.zero();
 	int i;
-	bc->get_block_handles_preload_data([&](ournode::block_handle & bh) -> bool
+	auto bcp = bc.lock();
+	bcp->get_blocks_raw_data([&](typename Persistence::persistent_index_block & pib, std::string & block_data) -> bool
 		{
-			Hash256 expected_hash = bh.hash;
 			ournode::block b;
-			if ( ! ournode::block_verifier::verify_candidade(bh, b))
+			Hash256 calculated_hash;
+			if ( ! ournode::block_verifier<Persistence>::verify(block_data, b, calculated_hash))
 				return false;
-			if (expected_hash != bh.hash)
+			if (pib.hash != calculated_hash)
 			{
-				utttil::error() << "Block " << i << "'s calculated hash doens't match the index" << bh.hash << std::endl;
-				utttil::error() << "Block's hash " << bh.hash << std::endl;
-				utttil::error() << "index's hash " << expected_hash << std::endl;
+				utttil::error() << "Block " << i << "'s calculated hash doens't match the index:" << std::endl;
+				utttil::error() << "Block's hash " << calculated_hash << std::endl;
+				utttil::error() << "index's hash " << pib.hash << std::endl;
 				return false;
 			}
 			if (b.prev_block_hash != previous_hash)
 			{
-				utttil::error() << "Block " << i << " out of order " << bh.hash << std::endl;
+				utttil::error() << "Block " << i << " out of order " << calculated_hash << std::endl;
 				utttil::error() << "Block's previous hash " << b.prev_block_hash << std::endl;
 				utttil::error() << "File's previous hash " << previous_hash << std::endl;
 				return false;
 			}
-			previous_hash = bh.hash;
+			previous_hash = calculated_hash;
 			if ((i&0xFFF) == 0)
 				utttil::info() << "Block " << i << " checked" << std::endl;
 			i++;
@@ -70,8 +75,7 @@ int main()
 		utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> conf;
 		conf->load("ournode.conf");
 		
-		utttil::synchronized<ournode::blockchain, boost::fibers::mutex, boost::fibers::condition_variable> bc;
-		bc->load("./testnet"); // select different folders for testnet3/mainnet
+		utttil::synchronized<ournode::blockchain<ournode::file_block_persistence>, boost::fibers::mutex, boost::fibers::condition_variable> bc("./testnet");
 		check_integrity(bc);
 
 		ournode::block_verifier verifier(bc);
