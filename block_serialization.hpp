@@ -33,8 +33,9 @@ struct file_block_persistence
 	std::ofstream fo_blocks;
 
 	file_block_persistence(std::filesystem::path p)
-		: folder(p)
+		: folder(p / "blocks")
 	{
+		std::filesystem::create_directories(folder);
 		fio_index.open(folder / "index", std::ios_base::app | std::ios_base::binary);
 
 		auto filename = folder / "0";
@@ -168,11 +169,6 @@ struct memory_block_persistence
 	std::deque<Hash256>     blocks_hash;
 
 	using index_block = std::uint32_t;
-	struct persistence_index_block
-	{
-		index_block ib;
-		Hash256 hash;
-	};
 
 	size_t size() const
 	{

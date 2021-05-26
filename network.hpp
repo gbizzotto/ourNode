@@ -760,7 +760,7 @@ struct peer_manager
 
 struct network
 {
-	using blockchain = ournode::blockchain<file_block_persistence>;
+	using blockchain = ournode::blockchain<file_block_persistence, memory_tx_persistence>;
 
 	std::shared_ptr<boost::asio::io_context> io_context;
 	utttil::synchronized<ournode::config                 , boost::fibers::mutex, boost::fibers::condition_variable> & conf;
@@ -772,7 +772,7 @@ struct network
 	int32_t peer_block_height = 0;
 	std::list<Hash256> missing_blocks;
 
-	block_verifier<file_block_persistence> & verifier;
+	block_verifier<file_block_persistence, memory_tx_persistence> & verifier;
 
 	bool go_on;
 	std::thread t;
@@ -787,7 +787,7 @@ struct network
 	boost::fibers::fiber keep_saving_conf_fiber;
 
 	
-	network(utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> & conf_, utttil::synchronized<blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_, block_verifier<file_block_persistence> & verifier_)
+	network(utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> & conf_, utttil::synchronized<blockchain, boost::fibers::mutex, boost::fibers::condition_variable> & bc_, block_verifier<file_block_persistence, memory_tx_persistence> & verifier_)
 		: io_context(std::make_shared<boost::asio::io_context>())
 		, conf(conf_)
 		, bc(bc_)

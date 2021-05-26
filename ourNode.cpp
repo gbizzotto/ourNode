@@ -10,8 +10,8 @@
 #include "block_serialization.hpp"
 #include "block_verifier.hpp"
 
-ournode::network                                         *g_net      = nullptr;
-ournode::block_verifier<ournode::file_block_persistence> *g_verifier = nullptr;
+ournode::network                                                                         *g_net      = nullptr;
+ournode::block_verifier<ournode::file_block_persistence, ournode::memory_tx_persistence> *g_verifier = nullptr;
 
 void ctrlc_handler(int sig)
 {
@@ -20,8 +20,8 @@ void ctrlc_handler(int sig)
 	g_verifier->stop_signal();
 }
 
-template<typename Persistence>
-void check_integrity(utttil::synchronized<ournode::blockchain<Persistence>, boost::fibers::mutex, boost::fibers::condition_variable> & bc)
+template<typename BlockPersistence, typename TxPersistence>
+void check_integrity(utttil::synchronized<ournode::blockchain<BlockPersistence, TxPersistence>, boost::fibers::mutex, boost::fibers::condition_variable> & bc)
 {
 	utttil::info() << "Checking integrity of blocks in persistent memory." << std::endl;
 	utttil::info() << "This will take a while." << std::endl;
@@ -33,11 +33,15 @@ void check_integrity(utttil::synchronized<ournode::blockchain<Persistence>, boos
 	previous_hash.zero();
 	int i;
 	auto bcp = bc.lock();
-	bcp->get_blocks_raw_data([&](typename Persistence::persistent_index_block & pib, std::string & block_data) -> bool
+	size_t total_blocks_size = 0;
+	size_t total_utxos_size = 0;
+	bcp->get_blocks_raw_data([&](typename BlockPersistence::persistent_index_block & pib, std::string & block_data) -> bool
 		{
+			total_blocks_size += block_data.size();
+
 			ournode::block b;
 			Hash256 calculated_hash;
-			if ( ! ournode::block_verifier<Persistence>::verify(block_data, b, calculated_hash))
+			if ( ! ournode::block_verifier<BlockPersistence, TxPersistence>::verify(block_data, b, calculated_hash))
 				return false;
 			if (pib.hash != calculated_hash)
 			{
@@ -54,8 +58,14 @@ void check_integrity(utttil::synchronized<ournode::blockchain<Persistence>, boos
 				return false;
 			}
 			previous_hash = calculated_hash;
-			if ((i&0xFFF) == 0)
+			if ((i&0xFFF) == 0) {
 				utttil::info() << "Block " << i << " checked" << std::endl;
+				utttil::info() << "block size: " << total_blocks_size << ", output_sie: " << total_utxos_size << std::endl;
+			}
+
+			for (const auto & tx : b.txs)
+				for (const auto & out : tx.outputs)
+					total_utxos_size += out.bytes_size();
 			i++;
 			return true;
 		});
@@ -75,7 +85,9 @@ int main()
 		utttil::synchronized<ournode::config, boost::fibers::mutex, boost::fibers::condition_variable> conf;
 		conf->load("ournode.conf");
 		
-		utttil::synchronized<ournode::blockchain<ournode::file_block_persistence>, boost::fibers::mutex, boost::fibers::condition_variable> bc("./testnet");
+		utttil::synchronized<ournode::blockchain<ournode::file_block_persistence, ournode::memory_tx_persistence>
+		                    ,boost::fibers::mutex
+		                    ,boost::fibers::condition_variable> bc("./testnet");
 		check_integrity(bc);
 
 		ournode::block_verifier verifier(bc);

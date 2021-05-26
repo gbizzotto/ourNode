@@ -43,18 +43,18 @@ struct candidate_block
 	Hash256 expected_hash;
 };
 
-template<typename Persistence>
+template<typename BlockPersistence, typename TxPersistence>
 struct block_verifier
 {
 	utttil::synchronized<std::deque<candidate_block>> candidates;
 	utttil::synchronized<std::deque<Hash256>> rejects;
 
-	utttil::synchronized<ournode::blockchain<Persistence>, boost::fibers::mutex, boost::fibers::condition_variable> & bc;
+	utttil::synchronized<ournode::blockchain<BlockPersistence, TxPersistence>, boost::fibers::mutex, boost::fibers::condition_variable> & bc;
 	
 	bool go_on = true;
 	std::thread t;
 
-	block_verifier(utttil::synchronized<ournode::blockchain<Persistence>, boost::fibers::mutex, boost::fibers::condition_variable> & bc_)
+	block_verifier(utttil::synchronized<ournode::blockchain<BlockPersistence, TxPersistence>, boost::fibers::mutex, boost::fibers::condition_variable> & bc_)
 		: bc(bc_)
 	{}
 	~block_verifier()
@@ -115,7 +115,7 @@ struct block_verifier
 					if ( ! verify(candidate.raw_data, block_to_fill, hash_to_fill))
 						rejects->emplace_back(std::move(candidate.expected_hash));
 					else
-						bc->add(std::string_view(candidate.raw_data.data(), candidate.raw_data.size()), candidate.expected_hash, block_to_fill.prev_block_hash);
+						bc->add(std::string_view(candidate.raw_data.data(), candidate.raw_data.size()), candidate.expected_hash, block_to_fill);
 				}
 		} catch(...) {
 			PRINT_TRACE

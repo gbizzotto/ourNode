@@ -10,6 +10,7 @@
 #include "sha256sum.hpp"
 #include "misc.hpp"
 #include "block_serialization.hpp"
+#include "tx_serialization.hpp"
 
 namespace ournode {
 
@@ -20,33 +21,54 @@ struct tx_handle
 	std::uint16_t tx_idx;
 	std::uint16_t output_idx;
 };
-
+*/
+template<typename Persistence>
 struct tx_hash_map
 {
 	using index_list = std::vector<uint32_t>;
-	int bits;
-	inline static const uint32_t no_height = uint32_t(-1);
+	inline static const uint32_t none = uint32_t(-1);
+	inline static Hash256 no_hash;
 
-	std::deque<tx_handle> tx_handles;
+	int bits;
+	std::deque<typename Persistence::index_block> tx_handles;
 	index_list index_by_hash_hash;
 
-	std::filesystem::path folder;
+	Persistence persistence;
 
-	std::ofstream foutindex;
-
-	static inline Hash256 no_hash;
-
-	tx_hash_map(std::filesystem::path p)
+	tx_hash_map()
 		: bits(0xFFFF) // start with any 2^n-1
-		, index_by_hash_hash((bits+1)*2, no_height)
-		, folder(p)
+		, index_by_hash_hash((bits+1)*2, none)
 	{
 		no_hash.zero();
-		
-		std::filesystem::create_directory(folder);
-		
-		auto index_path = folder / "txindex";
 	}
+	tx_hash_map(std::filesystem::path p)
+		: bits(0xFFFF) // start with any 2^n-1
+		, index_by_hash_hash((bits+1)*2, none)
+		, persistence(p)
+	{
+		no_hash.zero();
+
+		accomodate_new_size(persistence.size());
+		persistence.get_tx_pib([&](const typename Persistence::persistent_index_block & pib)
+			{
+				index_by_hash_hash[index_slot(pib.hash)] = tx_handles.size();
+				tx_handles.push_back(pib);
+			});
+	}
+
+	inline size_t size() const { return tx_handles.size(); }
+
+	//template<typename F>
+	//void get_tx_raw_data(F callback)
+	//{
+	//	persistence.get_tx_raw_data(callback);
+	//}
+
+	inline std::uint32_t make_hash_index(std::uint32_t hash_hash) const
+	{
+		return (hash_hash & bits) *2;
+	}
+
 	inline void accomodate_new_size(size_t new_size)
 	{
 		bool resize = new_size > bits;
@@ -54,28 +76,33 @@ struct tx_hash_map
 			return;
 		while(new_size > bits)
 			bits = bits*2 +1; // keep it 2^n-1
-		//index_by_hash_hash = index_list((bits+1)*2, no_height);
 		index_by_hash_hash.clear();
-		index_by_hash_hash.resize((bits+1)*2, no_height);
+		index_by_hash_hash.resize((bits+1)*2, none);
 		int i = 0;
-		for (const auto & handle : block_handles)
+		for (const auto & handle : tx_handles)
 			index_by_hash_hash[index_slot(handle.hash)] = i++;
 	}
 	
-	void add(const Hash256 & txid, tx_handle & txh)
+	inline void add_nocheck(std::vector<txout> outputs, const Hash256 & tx_hash)
 	{
+		typename Persistence::index_block ib = persistence.store(outputs, tx_hash);
+		
 		accomodate_new_size(size()+1);
-		index_by_hash_hash[index_slot(handle.hash)] = block_handles.size();
-		block_handles.push_back(std::move(handle));
+		index_by_hash_hash[index_slot(tx_hash)] = tx_handles.size();
+		tx_handles.push_back(ib);
 	}
-	std::uint32_t index_slot(const Hash256 & block_hash) const
+
+	inline std::uint32_t index_slot(std::uint32_t hash_idx) const
 	{
-		uint32_t hash_hash = (block_hash.hash_hash & bits)*2;
-		while(index_by_hash_hash[hash_hash] != no_height)
-			hash_hash = (hash_hash+1) & bits;
-		return hash_hash;
+		while(index_by_hash_hash[hash_idx] != none)
+			hash_idx = (hash_idx+1) & bits;
+		return hash_idx;
 	}
-};*/
+	inline std::uint32_t index_slot(const Hash256 & tx_hash) const
+	{
+		return index_slot(make_hash_index(tx_hash.hash_hash));
+	}
+};
 
 
 template<typename Persistence>
@@ -96,8 +123,11 @@ struct block_hash_map
 	block_hash_map<memory_block_persistence>()
 		: bits(0xFF) // start with any 2^n-1
 		, height_by_hash_idx((bits+1)*2, no_height)
-	{}
-	block_hash_map<  file_block_persistence>(std::filesystem::path p)
+	{
+		no_hash.zero();
+		last_known_hash.zero();
+	}
+	block_hash_map<file_block_persistence>(std::filesystem::path p)
 		: bits(0xFF) // start with any 2^n-1
 		, height_by_hash_idx((bits+1)*2, no_height)
 		, persistence(p)
@@ -185,21 +215,24 @@ struct block_hash_map
 };
 
 
-template<typename Persistence>
+template<typename BlockPersistence, typename TxPersistence>
 struct blockchain
 {
 	static inline const Hash256 testnet_genesis_block_hash = 0x000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943_bigendian_sha256;
 	static inline const uint32_t no_height = -1;
 
-	block_hash_map<Persistence> root_chain;
-	std::deque<std::unique_ptr<blockchain<memory_block_persistence>>> branches;
-	std::deque<std::unique_ptr<blockchain<memory_block_persistence>>> orphan_chains;
+	block_hash_map<BlockPersistence> root_chain;
+	std::deque<std::unique_ptr<blockchain<memory_block_persistence, memory_tx_persistence>>> branches;
+	std::deque<std::unique_ptr<blockchain<memory_block_persistence, memory_tx_persistence>>> orphan_chains;
+
+	tx_hash_map<TxPersistence> root_chain_txs;
 
 	Hash256 parent_block_hash;
 
-	blockchain<memory_block_persistence>() {}
-	blockchain<  file_block_persistence>(std::filesystem::path folder)
+	blockchain<memory_block_persistence, memory_tx_persistence>() {}
+	blockchain<  file_block_persistence, memory_tx_persistence>(std::filesystem::path folder)
 		: root_chain(folder)
+		, root_chain_txs()
 	{}
 
 	template<typename F>
@@ -214,8 +247,8 @@ struct blockchain
 	bool has(const Hash256 & hash)
 	{
 		return root_chain.height(hash) != no_height
-		    || std::find_if(     branches.begin(),      branches.end(), [&hash](const std::unique_ptr<blockchain<memory_block_persistence>> & bcp) { return bcp->has(hash); }) != branches.end()
-		    || std::find_if(orphan_chains.begin(), orphan_chains.end(), [&hash](const std::unique_ptr<blockchain<memory_block_persistence>> & bcp) { return bcp->has(hash); }) != orphan_chains.end()
+		    || std::find_if(     branches.begin(),      branches.end(), [&hash](const std::unique_ptr<blockchain<memory_block_persistence, memory_tx_persistence>> & bcp) { return bcp->has(hash); }) != branches.end()
+		    || std::find_if(orphan_chains.begin(), orphan_chains.end(), [&hash](const std::unique_ptr<blockchain<memory_block_persistence, memory_tx_persistence>> & bcp) { return bcp->has(hash); }) != orphan_chains.end()
 		    ;
 	}
 
@@ -245,8 +278,10 @@ struct blockchain
 		}
 	}
 
-	void add(std::string_view block_data, const Hash256 & hash, const Hash256 & prev_block_hash, bool is_orphan=false)
+	void add(std::string_view block_data, const Hash256 & hash, const block & bl, bool is_orphan=false)
 	{
+		const Hash256 & prev_block_hash = bl.prev_block_hash;
+
 		//utttil::debug() << "Trying to add block with prev_block_hash: " << prev_block_hash << std::endl;
 		//utttil::debug() << "root_chain.get_last_known_block_hash(): " << root_chain.get_last_known_block_hash() << std::endl;
 		//utttil::debug() << "root_chain.size(): " << root_chain.size() << std::endl;
@@ -270,50 +305,50 @@ struct blockchain
 		for (auto & branch : branches)
 			if (branch->get_last_known_block_hash() == prev_block_hash) {
 				//utttil::debug() << "Added to an extra tip" << std::endl;
-				branch->add(block_data, hash, prev_block_hash);
+				branch->add(block_data, hash, bl);
 				return;
 			}
 		// orphan chains tips
 		for (auto & orphan_chain : orphan_chains)
 			if (orphan_chain->get_last_known_block_hash() == prev_block_hash) {
 				//utttil::debug() << "Added to orphan block chain" << std::endl;
-				orphan_chain->add(block_data, hash, prev_block_hash);
+				orphan_chain->add(block_data, hash, bl);
 				return;
 			}
 
 		// root chain new branch?
 		if (root_chain.height(prev_block_hash) != no_height) {
 			//utttil::debug() << "Added as new extra tip line" << std::endl;
-			branches.push_back(std::make_unique<blockchain<memory_block_persistence>>());
-			branches.back()->add(block_data, hash, prev_block_hash);
+			branches.push_back(std::make_unique<blockchain<memory_block_persistence, memory_tx_persistence>>());
+			branches.back()->add(block_data, hash, bl);
 			return;
 		}
 		// branch branch?
 		for (auto & branch : branches)
 			if (branch->has(prev_block_hash)) {
 				//utttil::debug() << "Added as new extra branch" << std::endl;
-				branch->add(block_data, hash, prev_block_hash);
+				branch->add(block_data, hash, bl);
 				return;
 			}
 		// orphan chain new branch?
 		for (auto & orphan : orphan_chains)
 			if (orphan->has(prev_block_hash)) {
 				//utttil::debug() << "Added as new extra branch" << std::endl;
-				orphan->add(block_data, hash, prev_block_hash);
+				orphan->add(block_data, hash, bl);
 				return;
 			}
 
 		//utttil::debug() << "Added as new orphan block line as orphan" << std::endl;
-		auto new_orphan = std::make_unique<blockchain<memory_block_persistence>>();
-		new_orphan->add(block_data, hash, prev_block_hash, true);
+		auto new_orphan = std::make_unique<blockchain<memory_block_persistence, memory_tx_persistence>>();
+		new_orphan->add(block_data, hash, bl, true);
 		check_vs_orphans(new_orphan->root_chain);
 		orphan_chains.emplace_back(std::move(new_orphan));
 	}
 	size_t size() const
 	{
 		return root_chain.size()
-		     + std::accumulate(branches     .begin(), branches     .end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain<memory_block_persistence>> & bhm) { return s + bhm->size(); })
-		     + std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain<memory_block_persistence>> & bhm) { return s + bhm->size(); })
+		     + std::accumulate(branches     .begin(), branches     .end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain<memory_block_persistence, memory_tx_persistence>> & bhm) { return s + bhm->size(); })
+		     + std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain<memory_block_persistence, memory_tx_persistence>> & bhm) { return s + bhm->size(); })
 			 ;
 	}
 
@@ -332,10 +367,10 @@ struct blockchain
 		//for (auto & orphan : orphan_chains)
 		//	orphan->print(indent+1);
 		utttil::info()
-		    << std::accumulate(branches.begin(), branches.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain<memory_block_persistence>> &bhm) { return s + bhm->size(); })
+		    << std::accumulate(branches.begin(), branches.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain<memory_block_persistence, memory_tx_persistence>> &bhm) { return s + bhm->size(); })
 		    << " in " << branches.size() << " branched chains." << std::endl;
 		utttil::info()
-		    << std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain<memory_block_persistence>> &bhm) { return s + bhm->size(); })
+		    << std::accumulate(orphan_chains.begin(), orphan_chains.end(), (size_t)0, [](size_t s, const std::unique_ptr<blockchain<memory_block_persistence, memory_tx_persistence>> &bhm) { return s + bhm->size(); })
 		    << " in " << orphan_chains.size() << " orphan chains." << std::endl;
 	}
 };
